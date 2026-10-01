@@ -19,6 +19,15 @@ type Config struct {
 
 	// LogLevel controls slog output verbosity: debug | info | warn | error.
 	LogLevel slog.Level
+
+	// KafkaBrokers is a list of Kafka broker addresses parsed from the
+	// comma-separated KAFKA_BROKER environment variable.
+	// Default: ["localhost:9092"]
+	KafkaBrokers []string
+
+	// KafkaTopic is the Kafka topic name to publish location events to.
+	// Default: "location.events"
+	KafkaTopic string
 }
 
 // Load reads .env from the current working directory and returns a Config.
@@ -41,7 +50,31 @@ func Load() (*Config, error) {
 	// ── LOG_LEVEL ────────────────────────────────────────────────────────────
 	cfg.LogLevel = parseLogLevel(getEnvOrDefault("LOG_LEVEL", "info"))
 
+	// ── KAFKA_BROKER ─────────────────────────────────────────────────────────
+	// Accepts a single address or a comma-separated list.
+	// Example: "localhost:9092" or "broker1:9092,broker2:9092"
+	rawBrokers := getEnvOrDefault("KAFKA_BROKER", "localhost:9092")
+	cfg.KafkaBrokers = parseBrokers(rawBrokers)
+	if len(cfg.KafkaBrokers) == 0 {
+		return nil, fmt.Errorf("KAFKA_BROKER resolved to an empty broker list (raw: %q)", rawBrokers)
+	}
+
+	// ── KAFKA_TOPIC ──────────────────────────────────────────────────────────
+	cfg.KafkaTopic = getEnvOrDefault("KAFKA_TOPIC", "location.events")
+
 	return cfg, nil
+}
+
+// parseBrokers splits a comma-separated broker string and trims whitespace.
+func parseBrokers(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if b := strings.TrimSpace(p); b != "" {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // getEnvOrDefault returns the value of the named environment variable or
