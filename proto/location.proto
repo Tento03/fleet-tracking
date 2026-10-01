@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package location;
+
+option go_package = "github.com/Tento03/fleet-tracking/proto;locationpb";
+
+// LocationService handles real-time GPS streaming from drivers.
+service LocationService {
+  // StreamLocation receives a client-side stream of GPS data points
+  // and returns a single summary response when the stream is closed.
+  rpc StreamLocation(stream LocationRequest) returns (LocationResponse);
+}
+
+// LocationRequest carries a single GPS data point from a driver.
+message LocationRequest {
+  // Unique identifier of the driver (UUID v4 or fixed simulator ID).
+  string driver_id = 1;
+
+  // WGS-84 latitude in decimal degrees [-90, 90].
+  double latitude = 2;
+
+  // WGS-84 longitude in decimal degrees [-180, 180].
+  double longitude = 3;
+
+  // Current speed in km/h.
+  float speed = 4;
+
+  // UNIX timestamp in milliseconds (UTC).
+  int64 timestamp = 5;
+}
+
+// LocationResponse is returned once after the client closes the stream.
+message LocationResponse {
+  // Indicates whether the stream was processed successfully.
+  bool success = 1;
+
+  // Human-readable message, e.g. "42 locations received".
+  string message = 2;
+}

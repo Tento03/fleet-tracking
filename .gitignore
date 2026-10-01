@@ -1,0 +1,29 @@
+# Environment variables
+.env
+
+# Node.js / Next.js
+node_modules/
+.next/
+out/
+dist/
+
+# Go binaries
+*.exe
+*.out
+ingestion/ingestion
+tracking/tracking
+simulator/simulator
+
+# Go build cache
+/vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Protobuf generated files (optional: commit if preferred)
+# proto/*.pb.go
