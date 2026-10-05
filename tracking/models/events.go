@@ -1,41 +1,22 @@
-// Package models defines the WebSocket broadcast event payloads used by
-// the tracking service. All events share a common envelope so the frontend
-// can dispatch on "type" before reading "payload".
+// Package models defines the WebSocket broadcast event payloads.
+// All events use the flat JSON format from KONTEKS GLOBAL.
 package models
 
 import "time"
 
-// ── WebSocket Event Envelope ──────────────────────────────────────────────
-
-// WSEvent is the top-level JSON envelope broadcast to every WebSocket client.
-//
-// Example:
-//
-//	{"type":"location_updated","payload":{...}}
-type WSEvent struct {
-	Type    string `json:"type"`
-	Payload any    `json:"payload"`
-}
-
-// ── Event types (string constants) ───────────────────────────────────────
-
+// Event type constants.
 const (
-	// EventLocationUpdated is broadcast on every successful GPS update.
-	EventLocationUpdated = "location_updated"
-
-	// EventDriverStatusChanged is broadcast when a driver's status changes
-	// (offline → online, online → offline, etc.).
+	EventLocationUpdated     = "location_updated"
 	EventDriverStatusChanged = "driver_status_changed"
-
-	// EventDriverRegistered is broadcast the first time a driver is seen
-	// (auto-registered via FirstOrCreate).
-	EventDriverRegistered = "driver_registered"
+	EventDriverRegistered    = "driver_registered"
 )
 
-// ── Payload structs ───────────────────────────────────────────────────────
-
-// LocationUpdatedPayload is the payload for EventLocationUpdated.
-type LocationUpdatedPayload struct {
+// LocationUpdatedEvent is the flat JSON broadcast for location_updated.
+//
+//   {"event":"location_updated","driver_id":"driver-001","latitude":-3.5952,
+//    "longitude":98.6722,"speed":40.5,"status":"online","timestamp":"..."}
+type LocationUpdatedEvent struct {
+	Event     string       `json:"event"`
 	DriverID  string       `json:"driver_id"`
 	Latitude  float64      `json:"latitude"`
 	Longitude float64      `json:"longitude"`
@@ -44,16 +25,32 @@ type LocationUpdatedPayload struct {
 	Timestamp time.Time    `json:"timestamp"`
 }
 
-// DriverStatusChangedPayload is the payload for EventDriverStatusChanged.
-type DriverStatusChangedPayload struct {
+// DriverStatusChangedEvent is the flat JSON broadcast for driver_status_changed.
+//
+//   {"event":"driver_status_changed","driver_id":"driver-001",
+//    "old_status":"offline","new_status":"online","timestamp":"..."}
+type DriverStatusChangedEvent struct {
+	Event     string       `json:"event"`
 	DriverID  string       `json:"driver_id"`
 	OldStatus DriverStatus `json:"old_status"`
 	NewStatus DriverStatus `json:"new_status"`
-	ChangedAt time.Time    `json:"changed_at"`
+	Timestamp time.Time    `json:"timestamp"`
 }
 
-// DriverRegisteredPayload is the payload for EventDriverRegistered.
-type DriverRegisteredPayload struct {
-	DriverID    string    `json:"driver_id"`
-	RegisteredAt time.Time `json:"registered_at"`
+// DriverInfo is the nested driver object inside DriverRegisteredEvent.
+type DriverInfo struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	Phone     string       `json:"phone"`
+	Vehicle   string       `json:"vehicle"`
+	Status    DriverStatus `json:"status"`
+	CreatedAt time.Time    `json:"created_at"`
+}
+
+// DriverRegisteredEvent is the flat JSON broadcast for driver_registered.
+//
+//   {"event":"driver_registered","driver":{"id":"...","name":"...","status":"offline",...}}
+type DriverRegisteredEvent struct {
+	Event  string     `json:"event"`
+	Driver DriverInfo `json:"driver"`
 }

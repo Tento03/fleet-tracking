@@ -1,4 +1,4 @@
-// Package services contains the stale-driver sweeper background goroutine.
+﻿// Package services contains the stale-driver sweeper background goroutine.
 package services
 
 import (
@@ -17,14 +17,6 @@ const sweeperInterval = 30 * time.Second
 // StaleSweeper is a background goroutine that periodically detects drivers
 // whose Redis key has expired (i.e. no GPS ping in the last 300 s) and marks
 // them offline.
-//
-// A driver is considered stale when:
-//   - Their status is online OR on_trip (they should be sending GPS).
-//   - Their Redis key "driver:location:{id}" no longer exists.
-//
-// On detection the sweeper:
-//  1. Updates MySQL status → offline.
-//  2. Broadcasts driver_status_changed to all WebSocket clients.
 type StaleSweeper struct {
 	driverRepo    repositories.DriverRepository
 	locationCache repositories.LocationCache
@@ -50,8 +42,7 @@ func NewStaleSweeper(
 	}
 }
 
-// Run starts the sweeper ticker. It blocks until ctx is cancelled; intended to
-// be launched as a goroutine from main.
+// Run starts the sweeper ticker. It blocks until ctx is cancelled.
 func (s *StaleSweeper) Run(ctx context.Context) {
 	s.log.Info("stale sweeper started", "interval", sweeperInterval)
 	defer s.log.Info("stale sweeper stopped")
@@ -71,7 +62,6 @@ func (s *StaleSweeper) Run(ctx context.Context) {
 
 // sweep performs one pass: load active drivers → check Redis → mark stale.
 func (s *StaleSweeper) sweep(ctx context.Context) {
-	// Load all active (online + on_trip) drivers from MySQL.
 	activeDrivers, err := s.driverRepo.FindByStatuses(ctx, []models.DriverStatus{
 		models.StatusOnline,
 		models.StatusOnTrip,
@@ -88,7 +78,6 @@ func (s *StaleSweeper) sweep(ctx context.Context) {
 	s.log.Debug("stale sweeper: checking drivers", "count", len(activeDrivers))
 
 	for _, driver := range activeDrivers {
-		// Skip if a new context cancellation happened mid-sweep.
 		if ctx.Err() != nil {
 			return
 		}
@@ -99,12 +88,10 @@ func (s *StaleSweeper) sweep(ctx context.Context) {
 				"driver_id", driver.ID,
 				"error", err,
 			)
-			// Can't determine staleness — be conservative and skip.
 			continue
 		}
 
 		if exists {
-			// Driver is alive; GPS key still in Redis.
 			continue
 		}
 
@@ -123,7 +110,6 @@ func (s *StaleSweeper) sweep(ctx context.Context) {
 			continue
 		}
 
-		// Broadcast the status change to all WebSocket clients.
 		s.broadcastStatusChanged(driver.ID, oldStatus, models.StatusOffline)
 	}
 }
@@ -133,16 +119,14 @@ func (s *StaleSweeper) broadcastStatusChanged(
 	driverID string,
 	oldStatus, newStatus models.DriverStatus,
 ) {
-	envelope := models.WSEvent{
-		Type: models.EventDriverStatusChanged,
-		Payload: models.DriverStatusChangedPayload{
-			DriverID:  driverID,
-			OldStatus: oldStatus,
-			NewStatus: newStatus,
-			ChangedAt: time.Now().UTC(),
-		},
+	evt := models.DriverStatusChangedEvent{
+		Event:     models.EventDriverStatusChanged,
+		DriverID:  driverID,
+		OldStatus: oldStatus,
+		NewStatus: newStatus,
+		Timestamp: time.Now().UTC(),
 	}
-	data, err := json.Marshal(envelope)
+	data, err := json.Marshal(evt)
 	if err != nil {
 		s.log.Error("stale sweeper: failed to marshal event", "error", err)
 		return

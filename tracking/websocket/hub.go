@@ -160,79 +160,12 @@ func (h *Hub) clientCountLocked() int {
 
 // ── Client ────────────────────────────────────────────────────────────────
 
-// Client represents a single WebSocket connection. It pumps outbound messages
-// from the send channel to the underlying conn.
+// Client represents a single WebSocket connection.
+// The read/write pump methods are defined in client.go alongside ServeWS.
 type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
 	send chan []byte
-}
-
-// NewClient registers a new client in the hub and returns the Client. Callers
-// must call client.WritePump() in a goroutine to start message delivery.
-func NewClient(hub *Hub, conn *websocket.Conn) *Client {
-	c := &Client{
-		hub:  hub,
-		conn: conn,
-		send: make(chan []byte, clientSendBuffer),
-	}
-	hub.register <- c
-	return c
-}
-
-// WritePump drains the send channel and writes messages to the WebSocket
-// connection. It runs until the channel is closed (hub disconnects the
-// client) or a write error occurs.
-func (c *Client) WritePump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
-	}()
-
-	for {
-		message, ok := <-c.send
-		if !ok {
-			// Hub closed the channel — send a close frame.
-			_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-			return
-		}
-
-		c.conn.SetWriteDeadline(time.Now().Add(writeTimeout)) //nolint:errcheck
-		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			c.hub.log.Warn("websocket write error",
-				"remote_addr", c.conn.RemoteAddr().String(),
-				"error", err,
-			)
-			return
-		}
-	}
-}
-
-// ReadPump reads from the WebSocket to detect disconnections (pings/pongs).
-// The browser sends no explicit messages; we just need to drain control frames
-// so the connection does not appear stale. Runs until the connection closes.
-func (c *Client) ReadPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
-	}()
-
-	c.conn.SetReadLimit(512)
-	for {
-		_, _, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err,
-				websocket.CloseGoingAway,
-				websocket.CloseAbnormalClosure,
-			) {
-				c.hub.log.Warn("websocket read error",
-					"remote_addr", c.conn.RemoteAddr().String(),
-					"error", err,
-				)
-			}
-			return
-		}
-	}
 }
 
 // Compile-time assertion that *Hub satisfies Broadcaster.

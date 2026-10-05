@@ -1,4 +1,4 @@
-// Package main is the entry point for the Fleet-Tracking service.
+﻿// Package main is the entry point for the Fleet-Tracking tracking service.
 //
 // Startup order:
 //  1. Load configuration from .env / environment variables.
@@ -9,7 +9,7 @@
 //  6. Build LocationService and StaleSweeper.
 //  7. Build Kafka consumer → start consumer in goroutine.
 //  8. Start StaleSweeper in goroutine.
-//  9. Start Gin HTTP server on :APP_PORT (only GET /ping for now).
+//  9. Start Gin HTTP server on :APP_PORT with all REST + WebSocket routes.
 // 10. Graceful shutdown: cancel ctx → server.Shutdown → consumer.Close → close DB & Redis.
 package main
 
@@ -35,25 +35,25 @@ import (
 )
 
 func main() {
-	// ── 1. Configuration ──────────────────────────────────────────────────
+	// ── 1. Configuration ───────────────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// ── Logging ───────────────────────────────────────────────────────────
+	// ── Logging ────────────────────────────────────────────────────────────
 	logHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.LogLevel,
 	})
 	logger := slog.New(logHandler)
 	slog.SetDefault(logger)
 
-	// ── Background context with cancellation ──────────────────────────────
+	// ── Background context with cancellation ───────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ── 2. MySQL (GORM) ───────────────────────────────────────────────────
+	// ── 2. MySQL (GORM) ────────────────────────────────────────────────────
 	logger.Info("connecting to MySQL", "host", cfg.DBHost, "db", cfg.DBName)
 	db, err := config.NewDB(cfg)
 	if err != nil {
@@ -62,7 +62,7 @@ func main() {
 	}
 	sqlDB, _ := db.DB()
 
-	// ── 3. Redis ──────────────────────────────────────────────────────────
+	// ── 3. Redis ───────────────────────────────────────────────────────────
 	logger.Info("connecting to Redis", "addr", cfg.RedisAddr())
 	redisClient, err := config.NewRedis(cfg)
 	if err != nil {
@@ -70,16 +70,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── 4. Repositories ───────────────────────────────────────────────────
+	// ── 4. Repositories ────────────────────────────────────────────────────
 	driverRepo := repositories.NewDriverRepository(db)
 	locationRepo := repositories.NewLocationRepository(db)
 	locationCache := repositories.NewLocationCache(redisClient)
 
-	// ── 5. WebSocket Hub ──────────────────────────────────────────────────
+	// ── 5. WebSocket Hub ───────────────────────────────────────────────────
 	hub := trackingws.NewHub(logger)
 	go hub.Run(ctx)
 
-	// ── 6. Services ───────────────────────────────────────────────────────
+	// ── 6. Services ────────────────────────────────────────────────────────
 	locationService := services.NewLocationService(
 		driverRepo,
 		locationRepo,
@@ -94,7 +94,7 @@ func main() {
 		logger,
 	)
 
-	// ── 7. Kafka Consumer ─────────────────────────────────────────────────
+	// ── 7. Kafka Consumer ──────────────────────────────────────────────────
 	logger.Info("connecting to Kafka", "brokers", cfg.KafkaBrokers)
 	consumer, err := trackingkafka.NewConsumer(
 		cfg.KafkaBrokers,
@@ -113,10 +113,17 @@ func main() {
 		"topic", cfg.KafkaTopic,
 	)
 
-	// ── 8. Stale sweeper ──────────────────────────────────────────────────
+	// ── 8. Stale sweeper ───────────────────────────────────────────────────
 	go staleSweeper.Run(ctx)
 
-	// ── 9. Gin HTTP server ────────────────────────────────────────────────
+	// ── 9. Timezone ────────────────────────────────────────────────────────
+	tz, err := time.LoadLocation(cfg.AppTimezone)
+	if err != nil {
+		logger.Warn("unknown APP_TIMEZONE – falling back to UTC", "tz", cfg.AppTimezone)
+		tz = time.UTC
+	}
+
+	// ── Gin HTTP server ────────────────────────────────────────────────────
 	if cfg.LogLevel != slog.LevelDebug {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -124,7 +131,6 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
-	// Logger middleware (uses slog-compatible output in non-debug mode).
 	if cfg.LogLevel == slog.LevelDebug {
 		r.Use(gin.Logger())
 	}
@@ -138,7 +144,19 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
-	routes.Register(r, sqlDB, redisClient, consumer)
+	// Wire all routes.
+	routes.Setup(r, routes.Config{
+		DriverRepo:    driverRepo,
+		LocationRepo:  locationRepo,
+		LocationCache: locationCache,
+		Hub:           hub,
+		KafkaChecker:  consumer,
+		CORSOrigin:    cfg.CORSOrigin,
+		Timezone:      tz,
+		Logger:        logger,
+		SQLDB:         sqlDB,
+		RedisCl:       redisClient,
+	})
 
 	server := &http.Server{
 		Addr:         ":" + cfg.AppPort,
@@ -157,7 +175,7 @@ func main() {
 		}
 	}()
 
-	// ── 10. Graceful shutdown ─────────────────────────────────────────────
+	// ── 10. Graceful shutdown ──────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
