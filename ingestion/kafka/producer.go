@@ -1,9 +1,9 @@
-// Package kafka provides a Kafka SyncProducer wrapper for the ingestion service.
-// It implements handler.EventPublisher so it can be injected directly into
-// LocationHandler without the handler knowing about Kafka internals.
+// Package kafka provides a non-blocking Sarama AsyncProducer wrapper for the ingestion service.
+// It implements handler.EventPublisher so it can be injected directly into LocationHandler.
 package kafka
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,265 +13,174 @@ import (
 	"github.com/IBM/sarama"
 )
 
-// ── Sentinel / category errors ────────────────────────────────────────────
+var (
+	// ErrBackpressure is returned when the internal producer channel is full.
+	ErrBackpressure = errors.New("backpressure: producer buffer full")
+	// ErrClosed is returned when attempting to publish to a closed producer.
+	ErrClosed = errors.New("kafka producer is closed")
+)
 
-// isRetriableError returns true when the Kafka error is likely caused by a
-// transient broker connectivity problem (not a bad message).
-func isRetriableError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Check package-level sentinel errors.
-	if errors.Is(err, sarama.ErrOutOfBrokers) ||
-		errors.Is(err, sarama.ErrClosedClient) {
-		return true
-	}
-	// Check sarama typed protocol errors.
-	var kErr sarama.KError
-	if errors.As(err, &kErr) {
-		switch kErr {
-		case sarama.ErrBrokerNotAvailable,
-			sarama.ErrLeaderNotAvailable,
-			sarama.ErrNotLeaderForPartition,
-			sarama.ErrNetworkException:
-			return true
-		}
-	}
-	return false
-}
-
-// ── KafkaProducer ─────────────────────────────────────────────────────────
-
-// KafkaProducer wraps a sarama.SyncProducer with automatic reconnection
-// on transient network / broker failures. All public methods are safe for
-// concurrent use.
+// KafkaProducer wraps a sarama.AsyncProducer with non-blocking publish
+// and background goroutines to drain successes and errors.
 type KafkaProducer struct {
-	mu       sync.RWMutex
-	producer sarama.SyncProducer
-	client   sarama.Client // kept alive to check connectivity
-	brokers  []string
-	cfg      *sarama.Config
+	producer sarama.AsyncProducer
+	buffer   chan *sarama.ProducerMessage
 	log      *slog.Logger
+	wg       sync.WaitGroup
+	closed   chan struct{}
+	once     sync.Once
 }
 
-// buildSaramaConfig returns a sarama.Config tuned for reliable, ordered
-// delivery keyed by driver_id.
+// buildSaramaConfig returns an idempotent, strictly ordered Sarama configuration.
 func buildSaramaConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
 
-	// Producer must confirm all in-sync replicas have written the message.
+	// acks=all
 	cfg.Producer.RequiredAcks = sarama.WaitForAll
 
-	// Return success / error via channels so SyncProducer can work.
+	// Idempotent producer guarantees exactly-once delivery within a partition
+	cfg.Producer.Idempotent = true
+	cfg.Net.MaxOpenRequests = 1
+
+	// Must enable Return.Successes and Return.Errors for AsyncProducer
 	cfg.Producer.Return.Successes = true
 	cfg.Producer.Return.Errors = true
 
-	// Up to 5 automatic retries on transient send failures.
+	// Retries with exponential-like backoff
 	cfg.Producer.Retry.Max = 5
 	cfg.Producer.Retry.Backoff = 250 * time.Millisecond
 
-	// HashPartitioner ensures the same driver_id always lands on the
-	// same partition, which keeps per-driver message ordering intact.
+	// Hash partitioner routes identical keys (driver_code) to the exact same partition
 	cfg.Producer.Partitioner = sarama.NewHashPartitioner
 
-	// Compression reduces bandwidth between ingestion and Kafka.
+	// Snappy compression for optimal throughput and low CPU overhead
 	cfg.Producer.Compression = sarama.CompressionSnappy
 
-	// Version — Kafka 2.x+ is required for sticky partitioning.
+	// Kafka 2.6+ required for idempotent producer
 	cfg.Version = sarama.V2_6_0_0
 
 	return cfg
 }
 
-// NewKafkaProducer connects to Kafka, retrying up to maxRetries times with
-// a fixed backoff between attempts. This makes the ingestion service
-// resilient to Kafka being temporarily unavailable at startup.
-func NewKafkaProducer(brokers []string, logger *slog.Logger) (*KafkaProducer, error) {
+// NewKafkaProducer connects to Kafka using Sarama's AsyncProducer.
+// bufferSize controls the capacity of the non-blocking ingress channel.
+func NewKafkaProducer(brokers []string, bufferSize int, logger *slog.Logger) (*KafkaProducer, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-
-	const maxRetries = 10
-	const retryBackoff = 2 * time.Second
+	if bufferSize <= 0 {
+		bufferSize = 1000
+	}
 
 	cfg := buildSaramaConfig()
+	producer, err := sarama.NewAsyncProducer(brokers, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create async producer: %w", err)
+	}
 
-	var (
-		client   sarama.Client
-		producer sarama.SyncProducer
-		lastErr  error
+	kp := &KafkaProducer{
+		producer: producer,
+		buffer:   make(chan *sarama.ProducerMessage, bufferSize),
+		log:      logger,
+		closed:   make(chan struct{}),
+	}
+
+	// 1. Goroutine feeding buffer into producer.Input()
+	kp.wg.Add(1)
+	go func() {
+		defer kp.wg.Done()
+		for {
+			select {
+			case <-kp.closed:
+				// Drain remaining messages before exiting
+				for {
+					select {
+					case msg := <-kp.buffer:
+						producer.Input() <- msg
+					default:
+						return
+					}
+				}
+			case msg, ok := <-kp.buffer:
+				if !ok {
+					return
+				}
+				producer.Input() <- msg
+			}
+		}
+	}()
+
+	// 2. Goroutine draining successes
+	kp.wg.Add(1)
+	go func() {
+		defer kp.wg.Done()
+		for succ := range producer.Successes() {
+			logger.Debug("kafka message acknowledged",
+				"topic", succ.Topic,
+				"partition", succ.Partition,
+				"offset", succ.Offset,
+				"key", string(succ.Key.(sarama.StringEncoder)),
+			)
+		}
+	}()
+
+	// 3. Goroutine draining errors
+	kp.wg.Add(1)
+	go func() {
+		defer kp.wg.Done()
+		for prodErr := range producer.Errors() {
+			logger.Error("kafka message delivery failed",
+				"topic", prodErr.Msg.Topic,
+				"key", string(prodErr.Msg.Key.(sarama.StringEncoder)),
+				"error", prodErr.Err,
+			)
+		}
+	}()
+
+	logger.Info("kafka async producer initialized",
+		"brokers", brokers,
+		"buffer_size", bufferSize,
 	)
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		var err error
-
-		client, err = sarama.NewClient(brokers, cfg)
-		if err != nil {
-			lastErr = err
-			logger.Warn("kafka: connect attempt failed – retrying",
-				"attempt", attempt,
-				"max", maxRetries,
-				"brokers", brokers,
-				"error", err,
-				"backoff", retryBackoff,
-			)
-			time.Sleep(retryBackoff)
-			continue
-		}
-
-		producer, err = sarama.NewSyncProducerFromClient(client)
-		if err != nil {
-			client.Close() //nolint:errcheck
-			lastErr = err
-			logger.Warn("kafka: producer init failed – retrying",
-				"attempt", attempt,
-				"error", err,
-			)
-			time.Sleep(retryBackoff)
-			continue
-		}
-
-		logger.Info("kafka: producer connected",
-			"brokers", brokers,
-			"attempt", attempt,
-		)
-		return &KafkaProducer{
-			producer: producer,
-			client:   client,
-			brokers:  brokers,
-			cfg:      cfg,
-			log:      logger,
-		}, nil
-	}
-
-	return nil, fmt.Errorf("kafka: failed to connect after %d attempts: %w", maxRetries, lastErr)
+	return kp, nil
 }
 
-// ── reconnect (internal, must be called with mu write-locked) ────────────
-
-func (kp *KafkaProducer) reconnect() error {
-	kp.log.Warn("kafka: attempting producer reconnect")
-
-	// Best-effort close of old resources.
-	if kp.producer != nil {
-		_ = kp.producer.Close()
-	}
-	if kp.client != nil {
-		_ = kp.client.Close()
+// Publish enqueues a message without blocking. If the internal buffer is full,
+// it immediately returns ErrBackpressure.
+func (kp *KafkaProducer) Publish(ctx context.Context, topic, key string, value []byte) error {
+	select {
+	case <-kp.closed:
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
-	client, err := sarama.NewClient(kp.brokers, kp.cfg)
-	if err != nil {
-		return fmt.Errorf("kafka reconnect – client: %w", err)
-	}
-
-	producer, err := sarama.NewSyncProducerFromClient(client)
-	if err != nil {
-		_ = client.Close()
-		return fmt.Errorf("kafka reconnect – producer: %w", err)
-	}
-
-	kp.client = client
-	kp.producer = producer
-	kp.log.Info("kafka: producer reconnected successfully")
-	return nil
-}
-
-// ── Publish ───────────────────────────────────────────────────────────────
-
-// Publish sends a single message to the given topic, using key as the
-// partition routing key (driver_id in our case).
-//
-// On transient connectivity errors the producer is recreated and the send
-// is retried exactly once. If the retry also fails, the error is returned
-// and the caller decides whether to continue or abort.
-func (kp *KafkaProducer) Publish(topic, key string, value []byte) error {
 	msg := &sarama.ProducerMessage{
 		Topic: topic,
 		Key:   sarama.StringEncoder(key),
 		Value: sarama.ByteEncoder(value),
 	}
 
-	// ── First attempt (read-locked) ───────────────────────────────────────
-	kp.mu.RLock()
-	_, _, err := kp.producer.SendMessage(msg)
-	kp.mu.RUnlock()
-
-	if err == nil {
+	select {
+	case kp.buffer <- msg:
 		return nil
+	default:
+		kp.log.Warn("kafka producer backpressure: buffer full",
+			"topic", topic,
+			"key", key,
+		)
+		return ErrBackpressure
 	}
-
-	// ── Retriable error → reconnect and retry once ────────────────────────
-	if !isRetriableError(err) {
-		return fmt.Errorf("kafka publish: %w", err)
-	}
-
-	kp.log.Warn("kafka: retriable send error – reconnecting",
-		"topic", topic,
-		"key", key,
-		"error", err,
-	)
-
-	kp.mu.Lock()
-	reconnErr := kp.reconnect()
-	kp.mu.Unlock()
-
-	if reconnErr != nil {
-		return fmt.Errorf("kafka publish: reconnect failed: %w", reconnErr)
-	}
-
-	// Retry once after successful reconnect.
-	kp.mu.RLock()
-	_, _, retryErr := kp.producer.SendMessage(msg)
-	kp.mu.RUnlock()
-
-	if retryErr != nil {
-		return fmt.Errorf("kafka publish retry: %w", retryErr)
-	}
-	return nil
 }
 
-// ── IsConnected ───────────────────────────────────────────────────────────
-
-// IsConnected reports whether the underlying sarama client and at least one
-// broker are reachable. Useful for health-check endpoints.
-func (kp *KafkaProducer) IsConnected() bool {
-	kp.mu.RLock()
-	defer kp.mu.RUnlock()
-
-	if kp.client == nil || kp.client.Closed() {
-		return false
-	}
-	brokers := kp.client.Brokers()
-	for _, b := range brokers {
-		if connected, _ := b.Connected(); connected {
-			return true
-		}
-	}
-	return false
-}
-
-// ── Close ─────────────────────────────────────────────────────────────────
-
-// Close flushes any pending messages and shuts down the producer and client.
-// It should be called exactly once during service shutdown.
+// Close gracefully flushes pending messages and stops the producer.
 func (kp *KafkaProducer) Close() error {
-	kp.mu.Lock()
-	defer kp.mu.Unlock()
-
-	var errs []error
-	if kp.producer != nil {
-		if err := kp.producer.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("producer close: %w", err))
-		}
-	}
-	if kp.client != nil {
-		if err := kp.client.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("client close: %w", err))
-		}
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	return nil
+	var closeErr error
+	kp.once.Do(func() {
+		close(kp.closed)
+		kp.wg.Wait()
+		closeErr = kp.producer.Close()
+	})
+	return closeErr
 }

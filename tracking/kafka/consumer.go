@@ -17,28 +17,23 @@ import (
 
 // ── LocationProcessor ─────────────────────────────────────────────────────
 
-// LocationProcessor is the interface the consumer depends on. Keeping it as
-// an interface enables unit-testing the consumer without a real Kafka broker.
+// LocationProcessor is the interface the consumer depends on.
 type LocationProcessor interface {
 	ProcessLocation(ctx context.Context, event *models.LocationEvent) error
 }
 
 // ── Consumer ──────────────────────────────────────────────────────────────
 
-// Consumer wraps a sarama ConsumerGroup and implements
-// sarama.ConsumerGroupHandler. It loops Consume inside a goroutine,
-// auto-rejoins after every rebalance, and respects ctx cancellation.
+// Consumer wraps a sarama ConsumerGroup and implements sarama.ConsumerGroupHandler.
 type Consumer struct {
 	group     sarama.ConsumerGroup
 	topics    []string
 	service   LocationProcessor
-	connected atomic.Bool // true between Setup and Cleanup
+	connected atomic.Bool
 	log       *slog.Logger
 }
 
 // NewConsumer creates a Consumer that subscribes to topic using groupID.
-// It connects to brokers with OffsetNewest (skip historic messages on first
-// start) and retries until the broker is reachable (up to 10 × 2 s).
 func NewConsumer(
 	brokers []string,
 	groupID string,
@@ -55,8 +50,6 @@ func NewConsumer(
 	cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{
 		sarama.NewBalanceStrategyRoundRobin(),
 	}
-	// Start from newest offset so we do not replay historical events on
-	// service restart.
 	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
 	cfg.Consumer.Return.Errors = true
 
@@ -102,17 +95,8 @@ func NewConsumer(
 	return c, nil
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────
-
-// Start launches the consume loop in the background. The loop automatically
-// rejoins the group after each rebalance (sarama requires re-calling Consume
-// after every session ends). Stops when ctx is cancelled.
-//
-// Errors from the consumer-group's internal error channel are logged; they
-// do not terminate the loop.
+// Start launches the consume loop in the background.
 func (c *Consumer) Start(ctx context.Context) {
-	// Drain the error channel in a separate goroutine to avoid blocking the
-	// consume loop when errors arrive during rebalance.
 	go func() {
 		for err := range c.group.Errors() {
 			c.log.Error("kafka consumer group error", "error", err)
@@ -121,61 +105,43 @@ func (c *Consumer) Start(ctx context.Context) {
 
 	go func() {
 		for {
-			// Consume blocks until the session ends (rebalance or ctx cancel).
 			if err := c.group.Consume(ctx, c.topics, c); err != nil {
 				if ctx.Err() != nil {
-					// Normal shutdown — context cancelled.
 					return
 				}
 				c.log.Error("kafka consume error – will rejoin", "error", err)
 			}
-			// Context cancelled → exit the loop.
 			if ctx.Err() != nil {
 				return
 			}
-			// Otherwise: rebalance happened; loop back and rejoin.
 		}
 	}()
 }
 
-// ── Close ─────────────────────────────────────────────────────────────────
-
 // Close flushes any in-flight work and shuts down the consumer group.
-// Should be called once during graceful shutdown.
 func (c *Consumer) Close() error {
 	return c.group.Close()
 }
 
-// ── IsConnected ───────────────────────────────────────────────────────────
-
-// IsConnected returns true while a consumer-group session is active (between
-// Setup and Cleanup). Used by the health-check endpoint added in Prompt 6.
+// IsConnected returns true while a consumer-group session is active.
 func (c *Consumer) IsConnected() bool {
 	return c.connected.Load()
 }
 
 // ── sarama.ConsumerGroupHandler ───────────────────────────────────────────
 
-// Setup is called by sarama at the beginning of every consumer-group session,
-// before ConsumeClaim. We set the connected flag here.
 func (c *Consumer) Setup(_ sarama.ConsumerGroupSession) error {
 	c.connected.Store(true)
 	c.log.Info("kafka consumer session started")
 	return nil
 }
 
-// Cleanup is called by sarama at the end of every session, after all
-// ConsumeClaim goroutines have returned. We clear the connected flag here.
 func (c *Consumer) Cleanup(_ sarama.ConsumerGroupSession) error {
 	c.connected.Store(false)
 	c.log.Info("kafka consumer session ended")
 	return nil
 }
 
-// ConsumeClaim is called once per topic-partition claim in a session.
-// It reads messages from claim.Messages(), processes each one through the
-// LocationService, and always marks the message regardless of processing
-// outcome to avoid poison-pill scenarios.
 func (c *Consumer) ConsumeClaim(
 	session sarama.ConsumerGroupSession,
 	claim sarama.ConsumerGroupClaim,
@@ -187,13 +153,14 @@ func (c *Consumer) ConsumeClaim(
 				return nil
 			}
 
-			c.log.Info("Processing location event",
-				"driver_id", extractDriverID(msg.Value),
+			driverKey := extractDriverIdentifier(msg.Value)
+
+			c.log.Info("processing location event from kafka",
+				"driver", driverKey,
 				"partition", msg.Partition,
 				"offset", msg.Offset,
 			)
 
-			// Unmarshal the Kafka message payload.
 			var event models.LocationEvent
 			if err := json.Unmarshal(msg.Value, &event); err != nil {
 				c.log.Error("kafka: malformed JSON – skipping",
@@ -202,24 +169,24 @@ func (c *Consumer) ConsumeClaim(
 					"error", err,
 					"raw", string(msg.Value),
 				)
-				// Mark the message to advance the offset even though we
-				// cannot process it (poison-pill guard).
 				session.MarkMessage(msg, "")
 				continue
 			}
 
-			// Delegate to the service. On failure, log and mark anyway so
-			// a single bad message cannot stall the consumer.
+			// If event.DriverCode is missing, fallback to string(msg.Key)
+			if event.DriverCode == "" && len(msg.Key) > 0 {
+				event.DriverCode = string(msg.Key)
+			}
+
 			if err := c.service.ProcessLocation(session.Context(), &event); err != nil {
 				c.log.Error("kafka: ProcessLocation failed",
-					"driver_id", event.DriverID,
+					"driver_code", event.DriverCode,
 					"partition", msg.Partition,
 					"offset", msg.Offset,
 					"error", err,
 				)
 			}
 
-			// Always mark the message to commit the offset.
 			session.MarkMessage(msg, "")
 
 		case <-session.Context().Done():
@@ -228,19 +195,21 @@ func (c *Consumer) ConsumeClaim(
 	}
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────
-
-// extractDriverID is a best-effort helper that peeks at the driver_id field
-// in a raw JSON payload for logging purposes, without fully unmarshalling it.
-func extractDriverID(raw []byte) string {
+func extractDriverIdentifier(raw []byte) string {
 	var partial struct {
-		DriverID string `json:"driver_id"`
+		DriverCode string `json:"driver_code"`
+		DriverID   string `json:"driver_id"`
 	}
 	if err := json.Unmarshal(raw, &partial); err != nil {
 		return "<unknown>"
 	}
-	return partial.DriverID
+	if partial.DriverCode != "" {
+		return partial.DriverCode
+	}
+	if partial.DriverID != "" {
+		return partial.DriverID
+	}
+	return "<unknown>"
 }
 
-// Compile-time assertion: Consumer implements sarama.ConsumerGroupHandler.
 var _ sarama.ConsumerGroupHandler = (*Consumer)(nil)

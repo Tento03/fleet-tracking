@@ -1,5 +1,4 @@
-// Package models defines the persistent domain entities for the tracking
-// service. Each struct maps 1-to-1 to a MySQL table managed by GORM.
+// Package models defines the persistent domain entities for the tracking service.
 package models
 
 import (
@@ -28,13 +27,14 @@ const (
 // ── Driver ────────────────────────────────────────────────────────────────
 
 // Driver is the persistent record for a fleet driver.
-// The simulator uses its own fixed IDs (e.g. "driver-001"), so BeforeCreate
-// only generates a UUID when the ID field is blank — it never overwrites an
-// existing value supplied by the caller.
+// The primary key ID is always a UUID v4 string (varchar 36).
+// The business code (e.g. "driver-001") is stored in the unique Code column.
 type Driver struct {
-	// ID is a UUID v4 string (varchar 36). The simulator populates this field
-	// with its own stable identifier; the hook fills it only when blank.
+	// ID is the database UUID v4 primary key.
 	ID string `gorm:"type:varchar(36);primaryKey" json:"id"`
+
+	// Code is the unique business code (e.g. "driver-001").
+	Code string `gorm:"type:varchar(50);uniqueIndex;not null" json:"code"`
 
 	// Name is the driver's display name (required).
 	Name string `gorm:"type:varchar(100);not null" json:"name"`
@@ -46,16 +46,13 @@ type Driver struct {
 	Vehicle string `gorm:"type:varchar(50)" json:"vehicle"`
 
 	// Status holds the driver's current operational state.
-	// The MySQL enum enforces the domain constraint at the database level.
 	Status DriverStatus `gorm:"type:enum('offline','online','on_trip');default:'offline';index" json:"status"`
 
 	// CreatedAt is set once by GORM on insert.
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// BeforeCreate is a GORM hook that auto-assigns a UUID v4 to ID when the
-// field is empty. Drivers registered by the simulator arrive with their own
-// stable ID (e.g. "driver-001") and are not modified.
+// BeforeCreate is a GORM hook that auto-assigns a UUID v4 to ID when blank.
 func (d *Driver) BeforeCreate(_ *gorm.DB) error {
 	if d.ID == "" {
 		d.ID = uuid.New().String()

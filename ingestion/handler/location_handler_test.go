@@ -5,14 +5,14 @@ import (
 	"encoding/json"
 	"net"
 	"testing"
-	"time"
 
 	locationpb "github.com/Tento03/fleet-tracking/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// mockPublisher merekam event yang dipublish untuk validasi test.
+// mockPublisher records published events for test assertions.
 type mockPublisher struct {
 	events []struct {
 		Topic string
@@ -22,7 +22,7 @@ type mockPublisher struct {
 	shouldFail bool
 }
 
-func (m *mockPublisher) Publish(topic, key string, value []byte) error {
+func (m *mockPublisher) Publish(_ context.Context, topic, key string, value []byte) error {
 	if m.shouldFail {
 		return &mockError{msg: "simulated broker down"}
 	}
@@ -38,11 +38,10 @@ type mockError struct{ msg string }
 
 func (e *mockError) Error() string { return e.msg }
 
-func TestLocationHandler_StreamLocation_Success(t *testing.T) {
+func TestLocationHandler_StreamLocation_Bidirectional(t *testing.T) {
 	mockPub := &mockPublisher{}
 	h := NewLocationHandler(mockPub, "location.events", nil)
 
-	// Buat in-memory gRPC server
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
@@ -54,7 +53,6 @@ func TestLocationHandler_StreamLocation_Success(t *testing.T) {
 	go srv.Serve(lis)
 	defer srv.Stop()
 
-	// Client gRPC
 	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
@@ -67,40 +65,54 @@ func TestLocationHandler_StreamLocation_Success(t *testing.T) {
 		t.Fatalf("failed to open stream: %v", err)
 	}
 
-	// 1. Kirim frame valid
+	// 1. Send valid frame
 	err = stream.Send(&locationpb.LocationRequest{
-		DriverId:  "driver-01",
-		Latitude:  -6.2088,
-		Longitude: 106.8456,
-		Speed:     45.5,
-		Timestamp: time.Now().UnixMilli(),
+		EventId:    "evt-001",
+		DriverCode: "driver-001",
+		Latitude:   -3.5952,
+		Longitude:  98.6722,
+		Speed:      45.5,
+		Heading:    90.0,
+		Timestamp:  timestamppb.Now(),
 	})
 	if err != nil {
 		t.Fatalf("failed to send frame 1: %v", err)
 	}
 
-	// 2. Kirim frame tidak valid (latitude di luar jangkauan > 90) -> harus di-skip
+	ack1, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("failed to receive ack 1: %v", err)
+	}
+	if !ack1.GetAccepted() || ack1.GetEventId() != "evt-001" {
+		t.Fatalf("expected ack accepted for evt-001, got: %+v", ack1)
+	}
+
+	// 2. Send invalid frame (latitude > 90) -> should be rejected with accepted=false without breaking stream
 	err = stream.Send(&locationpb.LocationRequest{
-		DriverId:  "driver-01",
-		Latitude:  95.0, // Invalid!
-		Longitude: 106.8456,
-		Speed:     20.0,
+		EventId:    "evt-002",
+		DriverCode: "driver-001",
+		Latitude:   120.0,
+		Longitude:  98.6722,
+		Speed:      20.0,
 	})
 	if err != nil {
-		t.Fatalf("failed to send invalid frame: %v", err)
+		t.Fatalf("failed to send frame 2: %v", err)
 	}
 
-	// Tutup stream dan dapatkan respons summary
-	resp, err := stream.CloseAndRecv()
+	ack2, err := stream.Recv()
 	if err != nil {
-		t.Fatalf("failed to close and recv: %v", err)
+		t.Fatalf("failed to receive ack 2: %v", err)
+	}
+	if ack2.GetAccepted() {
+		t.Fatalf("expected ack rejected for invalid latitude, got accepted")
 	}
 
-	if !resp.GetSuccess() {
-		t.Errorf("expected success true, got false")
+	// Close stream
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("failed to close send: %v", err)
 	}
 
-	// Verifikasi event yang terkirim ke mock publisher
+	// Verify published events
 	if len(mockPub.events) != 1 {
 		t.Fatalf("expected 1 event published, got %d", len(mockPub.events))
 	}
@@ -109,17 +121,15 @@ func TestLocationHandler_StreamLocation_Success(t *testing.T) {
 	if ev.Topic != "location.events" {
 		t.Errorf("expected topic location.events, got %s", ev.Topic)
 	}
-	if ev.Key != "driver-01" {
-		t.Errorf("expected key driver-01, got %s", ev.Key)
+	if ev.Key != "driver-001" {
+		t.Errorf("expected key driver-001, got %s", ev.Key)
 	}
 
 	var parsed LocationEvent
 	if err := json.Unmarshal(ev.Value, &parsed); err != nil {
 		t.Fatalf("payload is not valid JSON: %v", err)
 	}
-	if parsed.DriverID != "driver-01" || parsed.Speed != 45.5 {
+	if parsed.DriverCode != "driver-001" || parsed.Speed != 45.5 || parsed.ReceivedAt == "" {
 		t.Errorf("unexpected parsed payload: %+v", parsed)
 	}
-
-	t.Logf("Response Message dari Ingestion Server: %s", resp.GetMessage())
 }

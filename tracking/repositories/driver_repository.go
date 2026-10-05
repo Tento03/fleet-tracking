@@ -46,6 +46,20 @@ func (r *gormDriverRepository) FindByID(ctx context.Context, id string) (*models
 	return &driver, nil
 }
 
+// ── FindByCode ────────────────────────────────────────────────────────────
+
+func (r *gormDriverRepository) FindByCode(ctx context.Context, code string) (*models.Driver, error) {
+	var driver models.Driver
+	err := r.db.WithContext(ctx).First(&driver, "code = ?", code).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, utils.ErrDriverNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", utils.ErrDatabase, err)
+	}
+	return &driver, nil
+}
+
 // ── FindAll ───────────────────────────────────────────────────────────────
 
 func (r *gormDriverRepository) FindAll(ctx context.Context) ([]models.Driver, error) {
@@ -135,9 +149,6 @@ func (r *gormDriverRepository) CountByStatus(ctx context.Context) (map[models.Dr
 
 // ── FindOnlineStale ───────────────────────────────────────────────────────
 
-// FindOnlineStale returns the subset of drivers (from ids) that are
-// currently online or on_trip. The stale sweeper calls this to know which
-// drivers should have an active Redis key.
 func (r *gormDriverRepository) FindOnlineStale(
 	ctx context.Context,
 	ids []string,
@@ -155,15 +166,12 @@ func (r *gormDriverRepository) FindOnlineStale(
 	return drivers, nil
 }
 
-// ── Ensure at compile time ────────────────────────────────────────────────
-
 // Compile-time assertion that gormDriverRepository satisfies DriverRepository.
 var _ DriverRepository = (*gormDriverRepository)(nil)
 
 // ── stale-sweeper helpers ─────────────────────────────────────────────────
 
 // GetAllActiveIDs returns the IDs of all online / on_trip drivers.
-// This is a convenience used by the stale sweeper goroutine.
 func GetAllActiveIDs(ctx context.Context, repo DriverRepository) ([]string, error) {
 	drivers, err := repo.FindByStatuses(ctx, []models.DriverStatus{
 		models.StatusOnline,
@@ -179,10 +187,6 @@ func GetAllActiveIDs(ctx context.Context, repo DriverRepository) ([]string, erro
 	return ids, nil
 }
 
-// ── timestamp guard ────────────────────────────────────────────────────────
-
-// driverUpdatedAt returns the UpdatedAt time for use in stale detection.
-// Uses a raw query so we do not need to add UpdatedAt to the model struct yet.
 func driverUpdatedAt(ctx context.Context, db *gorm.DB, id string) (time.Time, error) {
 	var t time.Time
 	err := db.WithContext(ctx).
@@ -193,5 +197,4 @@ func driverUpdatedAt(ctx context.Context, db *gorm.DB, id string) (time.Time, er
 	return t, err
 }
 
-// suppress unused import lint when driverUpdatedAt is not yet called outside tests.
 var _ = driverUpdatedAt

@@ -12,15 +12,18 @@ import (
 // ── DriverRepository ──────────────────────────────────────────────────────
 
 // DriverRepository defines all persistence operations for the Driver entity.
-// The GORM implementation lives in driver_repository.go.
 type DriverRepository interface {
 	// Create inserts a new driver record. The BeforeCreate hook assigns a UUID
 	// when driver.ID is empty.
 	Create(ctx context.Context, driver *models.Driver) error
 
-	// FindByID retrieves a driver by primary key.
+	// FindByID retrieves a driver by primary key UUID.
 	// Returns utils.ErrDriverNotFound when no row matches.
 	FindByID(ctx context.Context, id string) (*models.Driver, error)
+
+	// FindByCode retrieves a driver by its unique business code (e.g. "driver-001").
+	// Returns utils.ErrDriverNotFound when no row matches.
+	FindByCode(ctx context.Context, code string) (*models.Driver, error)
 
 	// FindAll returns every driver ordered by created_at DESC.
 	FindAll(ctx context.Context) ([]models.Driver, error)
@@ -36,12 +39,10 @@ type DriverRepository interface {
 	FirstOrCreate(ctx context.Context, driver *models.Driver) (*models.Driver, bool, error)
 
 	// CountByStatus counts drivers in each status group.
-	// Returns a map of status → count.
 	CountByStatus(ctx context.Context) (map[models.DriverStatus]int64, error)
 
 	// FindOnlineStale returns drivers whose IDs are in the provided slice
-	// and whose status is online or on_trip. Used by the stale sweeper to
-	// cross-reference against Redis key existence.
+	// and whose status is online or on_trip.
 	FindOnlineStale(ctx context.Context, ids []string) ([]models.Driver, error)
 }
 
@@ -74,12 +75,8 @@ type LocationCache interface {
 	GetLast(ctx context.Context, driverID string) (*models.LocationSnapshot, error)
 
 	// GetManyLast retrieves snapshots for multiple drivers in a single MGET.
-	// Missing keys are represented as nil entries in the returned slice
-	// (index-aligned with ids).
 	GetManyLast(ctx context.Context, ids []string) ([]*models.LocationSnapshot, error)
 
-	// Exists reports whether the cache key for driverID is present (and not
-	// expired). Used by the stale sweeper to detect drivers that have gone
-	// silent.
+	// Exists reports whether the cache key for driverID is present.
 	Exists(ctx context.Context, driverID string) (bool, error)
 }

@@ -1,8 +1,9 @@
-﻿// Package controllers implements the HTTP handlers for the tracking service.
+// Package controllers implements the HTTP handlers for the tracking service.
 package controllers
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -44,27 +45,42 @@ func NewDriverController(
 
 // ── POST /drivers ─────────────────────────────────────────────────────────────
 
-// Create registers a new driver (UUID, status offline) and broadcasts
-// driver_registered.
+// Create registers a driver or returns existing if code matches (idempotent).
 //
-// Request : { "name": "...", "phone": "...", "vehicle": "..." }
-// Response: 201 { "data": DriverResponse }
+// Request : { "code": "driver-001", "name": "...", "phone": "...", "vehicle": "..." }
+// Response: 201 { "data": DriverResponse } (or 200 if already exists)
 func (dc *DriverController) Create(c *gin.Context) {
+	ctx := c.Request.Context()
+
 	var req dto.CreateDriverRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.Fail(c, http.StatusBadRequest, "INVALID_INPUT", err.Error())
 		return
 	}
 
+	// Idempotency check: if driver with this business code already exists, return it
+	existing, err := dc.driverRepo.FindByCode(ctx, req.Code)
+	if err == nil && existing != nil {
+		dc.log.Info("driver code already registered, returning existing", "code", req.Code, "id", existing.ID)
+		utils.OK(c, toDriverResponse(existing))
+		return
+	}
+	if err != nil && !errors.Is(err, utils.ErrDriverNotFound) {
+		dc.log.Error("check existing driver by code failed", "code", req.Code, "error", err)
+		utils.Error(c, err)
+		return
+	}
+
 	driver := &models.Driver{
 		// ID left blank — BeforeCreate hook assigns UUID v4.
+		Code:    req.Code,
 		Name:    req.Name,
 		Phone:   req.Phone,
 		Vehicle: req.Vehicle,
 		Status:  models.StatusOffline,
 	}
 
-	if err := dc.driverRepo.Create(c.Request.Context(), driver); err != nil {
+	if err := dc.driverRepo.Create(ctx, driver); err != nil {
 		dc.log.Error("create driver: db error", "error", err)
 		utils.Error(c, err)
 		return
@@ -79,8 +95,6 @@ func (dc *DriverController) Create(c *gin.Context) {
 // ── GET /drivers ──────────────────────────────────────────────────────────────
 
 // List returns all drivers ordered by created_at DESC.
-//
-// Response: 200 { "data": [ DriverResponse, ... ] }
 func (dc *DriverController) List(c *gin.Context) {
 	drivers, err := dc.driverRepo.FindAll(c.Request.Context())
 	if err != nil {
@@ -97,9 +111,6 @@ func (dc *DriverController) List(c *gin.Context) {
 // ── GET /drivers/active ───────────────────────────────────────────────────────
 
 // ListActive returns drivers whose status is online or on_trip.
-// Each item includes the last-known location from Redis (null when absent).
-//
-// Response: 200 { "data": [ ActiveDriverResponse, ... ] }
 func (dc *DriverController) ListActive(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -112,7 +123,6 @@ func (dc *DriverController) ListActive(c *gin.Context) {
 		return
 	}
 
-	// Bulk-fetch last-known locations via MGET.
 	ids := make([]string, len(drivers))
 	for i, d := range drivers {
 		ids[i] = d.ID
@@ -139,9 +149,7 @@ func (dc *DriverController) ListActive(c *gin.Context) {
 
 // ── GET /drivers/:id ──────────────────────────────────────────────────────────
 
-// GetByID returns a single driver by its ID.
-//
-// Response: 200 { "data": DriverResponse } | 404
+// GetByID returns a single driver by primary UUID.
 func (dc *DriverController) GetByID(c *gin.Context) {
 	id := c.Param("id")
 	driver, err := dc.driverRepo.FindByID(c.Request.Context(), id)
@@ -155,9 +163,6 @@ func (dc *DriverController) GetByID(c *gin.Context) {
 // ── PATCH /drivers/:id/status ─────────────────────────────────────────────────
 
 // UpdateStatus changes a driver's status and broadcasts driver_status_changed.
-//
-// Request : { "status": "online" | "offline" | "on_trip" }
-// Response: 200 { "data": DriverResponse } | 400 | 404
 func (dc *DriverController) UpdateStatus(c *gin.Context) {
 	id := c.Param("id")
 
@@ -168,10 +173,8 @@ func (dc *DriverController) UpdateStatus(c *gin.Context) {
 	}
 
 	newStatus := models.DriverStatus(req.Status)
-
 	ctx := c.Request.Context()
 
-	// Fetch the current driver to capture oldStatus for the broadcast.
 	driver, err := dc.driverRepo.FindByID(ctx, id)
 	if err != nil {
 		utils.Error(c, err)
@@ -179,7 +182,6 @@ func (dc *DriverController) UpdateStatus(c *gin.Context) {
 	}
 
 	if driver.Status == newStatus {
-		// No-op — return current state.
 		utils.OK(c, toDriverResponse(driver))
 		return
 	}
@@ -192,8 +194,7 @@ func (dc *DriverController) UpdateStatus(c *gin.Context) {
 	}
 	driver.Status = newStatus
 
-	// Broadcast driver_status_changed.
-	dc.broadcastStatusChanged(id, oldStatus, newStatus)
+	dc.broadcastStatusChanged(driver, oldStatus, newStatus)
 
 	utils.OK(c, toDriverResponse(driver))
 }
@@ -203,6 +204,7 @@ func (dc *DriverController) UpdateStatus(c *gin.Context) {
 func toDriverResponse(d *models.Driver) dto.DriverResponse {
 	return dto.DriverResponse{
 		ID:        d.ID,
+		Code:      d.Code,
 		Name:      d.Name,
 		Phone:     d.Phone,
 		Vehicle:   d.Vehicle,
@@ -213,39 +215,43 @@ func toDriverResponse(d *models.Driver) dto.DriverResponse {
 
 func toLocationSnapshotResponse(s *models.LocationSnapshot) *dto.LocationSnapshotResponse {
 	return &dto.LocationSnapshotResponse{
-		DriverID:  s.DriverID,
-		Latitude:  s.Latitude,
-		Longitude: s.Longitude,
-		Speed:     s.Speed,
-		UpdatedAt: s.UpdatedAt.UTC().Format(time.RFC3339),
+		DriverID:   s.DriverID,
+		DriverCode: s.DriverCode,
+		Latitude:   s.Latitude,
+		Longitude:  s.Longitude,
+		Speed:      s.Speed,
+		Heading:    s.Heading,
+		UpdatedAt:  s.UpdatedAt.UTC().Format(time.RFC3339),
 	}
 }
 
 func (dc *DriverController) broadcastDriverRegistered(d *models.Driver) {
-	payload := map[string]any{
-		"event": models.EventDriverRegistered,
-		"driver": map[string]any{
-			"id":         d.ID,
-			"name":       d.Name,
-			"phone":      d.Phone,
-			"vehicle":    d.Vehicle,
-			"status":     string(d.Status),
-			"created_at": d.CreatedAt.UTC().Format(time.RFC3339),
+	payload := models.DriverRegisteredEvent{
+		Event: models.EventDriverRegistered,
+		Driver: models.DriverInfo{
+			ID:        d.ID,
+			Code:      d.Code,
+			Name:      d.Name,
+			Phone:     d.Phone,
+			Vehicle:   d.Vehicle,
+			Status:    d.Status,
+			CreatedAt: d.CreatedAt,
 		},
 	}
 	dc.broadcastJSON(payload)
 }
 
 func (dc *DriverController) broadcastStatusChanged(
-	driverID string,
+	driver *models.Driver,
 	oldStatus, newStatus models.DriverStatus,
 ) {
-	payload := map[string]any{
-		"event":      models.EventDriverStatusChanged,
-		"driver_id":  driverID,
-		"old_status": string(oldStatus),
-		"new_status": string(newStatus),
-		"timestamp":  time.Now().UTC().Format(time.RFC3339),
+	payload := models.DriverStatusChangedEvent{
+		Event:      models.EventDriverStatusChanged,
+		DriverID:   driver.ID,
+		DriverCode: driver.Code,
+		OldStatus:  oldStatus,
+		NewStatus:  newStatus,
+		Timestamp:  time.Now().UTC(),
 	}
 	dc.broadcastJSON(payload)
 }

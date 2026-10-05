@@ -1,4 +1,4 @@
-﻿// Package controllers implements the HTTP handlers for the tracking service.
+// Package controllers implements the HTTP handlers for the tracking service.
 package controllers
 
 import (
@@ -52,8 +52,6 @@ func NewLocationController(
 // ── GET /drivers/:id/location ─────────────────────────────────────────────────
 
 // GetLastLocation returns the last-known GPS position from Redis.
-//
-// Response: 200 { "data": LocationSnapshotResponse } | 404 LOCATION_NOT_FOUND
 func (lc *LocationController) GetLastLocation(c *gin.Context) {
 	driverID := c.Param("id")
 
@@ -69,32 +67,26 @@ func (lc *LocationController) GetLastLocation(c *gin.Context) {
 	}
 
 	utils.OK(c, dto.LocationSnapshotResponse{
-		DriverID:  snap.DriverID,
-		Latitude:  snap.Latitude,
-		Longitude: snap.Longitude,
-		Speed:     snap.Speed,
-		UpdatedAt: snap.UpdatedAt.UTC().Format(time.RFC3339),
+		DriverID:   snap.DriverID,
+		DriverCode: snap.DriverCode,
+		Latitude:   snap.Latitude,
+		Longitude:  snap.Longitude,
+		Speed:      snap.Speed,
+		Heading:    snap.Heading,
+		UpdatedAt:  snap.UpdatedAt.UTC().Format(time.RFC3339),
 	})
 }
 
 // ── GET /drivers/:id/history ──────────────────────────────────────────────────
 
 // GetHistory returns GPS history for a driver within a date/time window.
-//
-// Query params:
-//   date  = YYYY-MM-DD  (default: today in APP_TIMEZONE)
-//   start = HH:MM       (default: 00:00)
-//   end   = HH:MM       (default: 23:59)
-//   limit = int         (default 5000, max 20000)
-//
-// Response: 200 { "data": LocationHistoryResponse } | 400 | 404
 func (lc *LocationController) GetHistory(c *gin.Context) {
 	driverID := c.Param("id")
 	tz := lc.timezone
 
 	nowLocal := time.Now().In(tz)
 
-	// ── parse date ────────────────────────────────────────────────────────
+	// parse date
 	dateStr := c.DefaultQuery("date", nowLocal.Format("2006-01-02"))
 	date, err := time.ParseInLocation("2006-01-02", dateStr, tz)
 	if err != nil {
@@ -103,7 +95,7 @@ func (lc *LocationController) GetHistory(c *gin.Context) {
 		return
 	}
 
-	// ── parse start ───────────────────────────────────────────────────────
+	// parse start
 	startStr := c.DefaultQuery("start", "00:00")
 	startTime, err := parseHHMM(startStr, date, tz)
 	if err != nil {
@@ -112,7 +104,7 @@ func (lc *LocationController) GetHistory(c *gin.Context) {
 		return
 	}
 
-	// ── parse end ─────────────────────────────────────────────────────────
+	// parse end
 	endStr := c.DefaultQuery("end", "23:59")
 	endTime, err := parseHHMM(endStr, date, tz)
 	if err != nil {
@@ -127,7 +119,7 @@ func (lc *LocationController) GetHistory(c *gin.Context) {
 		return
 	}
 
-	// ── parse limit ───────────────────────────────────────────────────────
+	// parse limit
 	limit := defaultHistoryLimit
 	if limitStr := c.Query("limit"); limitStr != "" {
 		parsed, err := strconv.Atoi(limitStr)
@@ -141,13 +133,13 @@ func (lc *LocationController) GetHistory(c *gin.Context) {
 		limit = parsed
 	}
 
-	// ── ensure driver exists ──────────────────────────────────────────────
+	// ensure driver exists
 	if _, err := lc.driverRepo.FindByID(c.Request.Context(), driverID); err != nil {
 		utils.Error(c, err)
 		return
 	}
 
-	// ── query history (UTC) ───────────────────────────────────────────────
+	// query history (UTC)
 	fromUTC := startTime.UTC()
 	toUTC := endTime.UTC()
 
@@ -157,7 +149,6 @@ func (lc *LocationController) GetHistory(c *gin.Context) {
 		return
 	}
 
-	// Apply limit.
 	if len(history) > limit {
 		history = history[:limit]
 	}
@@ -168,6 +159,7 @@ func (lc *LocationController) GetHistory(c *gin.Context) {
 			Latitude:  h.Latitude,
 			Longitude: h.Longitude,
 			Speed:     h.Speed,
+			Heading:   h.Heading,
 			Timestamp: h.Timestamp.UTC().Format(time.RFC3339),
 		}
 	}
@@ -180,7 +172,6 @@ func (lc *LocationController) GetHistory(c *gin.Context) {
 	})
 }
 
-// parseHHMM parses an "HH:MM" string into a time.Time on the given date and timezone.
 func parseHHMM(s string, date time.Time, tz *time.Location) (time.Time, error) {
 	combined := date.Format("2006-01-02") + "T" + s + ":00"
 	t, err := time.ParseInLocation("2006-01-02T15:04:05", combined, tz)

@@ -1,17 +1,19 @@
 // Package main is the GPS simulator.
-// It spawns one goroutine per driver, each maintaining a single long-lived
-// client-streaming gRPC call to the ingestion service.
-// Drivers perform a realistic random-walk with smooth heading changes.
-// On SIGINT / SIGTERM each stream is closed cleanly via CloseAndRecv.
-// On transient stream errors the goroutine reconnects with exponential backoff.
+// It registers each simulated driver via POST /drivers (idempotent), then
+// opens a bidirectional streaming gRPC connection to the ingestion service
+// for each driver, sending realistic GPS updates and reading LocationAcks.
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -19,41 +21,69 @@ import (
 	"time"
 
 	locationpb "github.com/Tento03/fleet-tracking/proto"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// ── Constants ─────────────────────────────────────────────────────────────
+// ── Constants & Configuration ─────────────────────────────────────────────
 
 const (
-	serverAddr    = "localhost:50051"
-	sendInterval  = 3 * time.Second
-	minSpeed      = 20.0 // km/h
-	maxSpeed      = 60.0 // km/h
-	headingDelta  = 15.0 // max heading change per tick (degrees)
-	backoffBase   = 1 * time.Second
-	backoffMax    = 30 * time.Second
-	backoffFactor = 2.0
+	defaultServerAddr  = "localhost:50051"
+	defaultTrackingURL = "http://localhost:8080"
+	sendInterval       = 3 * time.Second
+	minSpeed           = 20.0 // km/h
+	maxSpeed           = 60.0 // km/h
+	headingDelta       = 15.0 // max heading change per tick (degrees)
+	backoffBase        = 1 * time.Second
+	backoffMax         = 30 * time.Second
+	backoffFactor      = 2.0
 )
 
 // ── Driver seed positions (Medan area) ────────────────────────────────────
 
 type driverSeed struct {
-	id  string
-	lat float64
-	lng float64
+	code    string
+	name    string
+	phone   string
+	vehicle string
+	lat     float64
+	lng     float64
 }
 
 var drivers = []driverSeed{
-	{"driver-001", -3.5952, 98.6722},
-	{"driver-002", -3.6012, 98.6800},
-	{"driver-003", -3.5880, 98.6650},
+	{
+		code:    "driver-001",
+		name:    "Budi Santoso",
+		phone:   "081234567801",
+		vehicle: "BK 1001 AA",
+		lat:     -3.5952,
+		lng:     98.6722,
+	},
+	{
+		code:    "driver-002",
+		name:    "Rian Hidayat",
+		phone:   "081234567802",
+		vehicle: "BK 2002 BB",
+		lat:     -3.6012,
+		lng:     98.6800,
+	},
+	{
+		code:    "driver-003",
+		name:    "Dewi Lestari",
+		phone:   "081234567803",
+		vehicle: "BK 3003 CC",
+		lat:     -3.5880,
+		lng:     98.6650,
+	},
 }
 
-// ── driverState tracks the current simulated position and heading ─────────
+// ── driverState tracks simulated movement ──────────────────────────────────
 
 type driverState struct {
-	id      string
+	code    string
 	lat     float64
 	lng     float64
 	heading float64 // degrees, 0 = North, clockwise
@@ -64,7 +94,7 @@ type driverState struct {
 func newDriverState(seed driverSeed) *driverState {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(seed.lat*1e6)))
 	return &driverState{
-		id:      seed.id,
+		code:    seed.code,
 		lat:     seed.lat,
 		lng:     seed.lng,
 		heading: rng.Float64() * 360,
@@ -73,62 +103,89 @@ func newDriverState(seed driverSeed) *driverState {
 	}
 }
 
-// advance moves the driver one tick forward.
-// heading changes smoothly (±headingDelta per tick).
-// speed varies randomly within [minSpeed, maxSpeed].
 func (d *driverState) advance() {
-	// Smooth heading change.
 	delta := (d.rng.Float64()*2 - 1) * headingDelta
 	d.heading = math.Mod(d.heading+delta+360, 360)
-
-	// Randomise speed within band.
 	d.speed = minSpeed + d.rng.Float64()*(maxSpeed-minSpeed)
 
-	// Distance covered in one tick (km).
 	distKm := d.speed * sendInterval.Hours()
-
-	// Convert to lat/lng delta.
-	// 1 degree latitude ≈ 111.32 km.
-	// 1 degree longitude ≈ 111.32 * cos(lat) km.
 	headingRad := d.heading * math.Pi / 180
 	d.lat += (distKm / 111.32) * math.Cos(headingRad)
 	d.lng += (distKm / (111.32 * math.Cos(d.lat*math.Pi/180))) * math.Sin(headingRad)
 
-	// Clamp to valid ranges.
 	d.lat = math.Max(-90, math.Min(90, d.lat))
 	d.lng = math.Max(-180, math.Min(180, d.lng))
 }
 
-// ── gRPC connection helper ────────────────────────────────────────────────
+// ── Driver Registration (idempotent POST /drivers) ────────────────────────
 
-func dialGRPC() (*grpc.ClientConn, error) {
-	conn, err := grpc.NewClient(
-		serverAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	return conn, err
+func registerDriver(ctx context.Context, trackingURL string, seed driverSeed, logger *slog.Logger) error {
+	url := fmt.Sprintf("%s/drivers", trackingURL)
+	payload := map[string]string{
+		"code":    seed.code,
+		"name":    seed.name,
+		"phone":   seed.phone,
+		"vehicle": seed.vehicle,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		logger.Info("driver registered successfully (or already exists)",
+			"code", seed.code,
+			"status_code", resp.StatusCode,
+		)
+		return nil
+	}
+
+	return fmt.Errorf("registration returned status %d: %s", resp.StatusCode, string(respBytes))
 }
 
-// ── runDriver manages the lifecycle for a single driver ──────────────────
+// ── gRPC connection helper ────────────────────────────────────────────────
 
-func runDriver(ctx context.Context, seed driverSeed, logger *slog.Logger) {
+func dialGRPC(addr string) (*grpc.ClientConn, error) {
+	return grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+}
+
+// ── runDriver manages lifecycle for a single driver ───────────────────────
+
+func runDriver(ctx context.Context, seed driverSeed, serverAddr, apiKey string, logger *slog.Logger) {
 	state := newDriverState(seed)
 	backoff := backoffBase
 
 	for {
-		// Check for shutdown before attempting (re)connection.
 		select {
 		case <-ctx.Done():
-			logger.Info("driver shutting down", "driver_id", state.id)
+			logger.Info("driver worker stopping", "driver_code", state.code)
 			return
 		default:
 		}
 
-		// ── Dial ──────────────────────────────────────────────────────────
-		conn, err := dialGRPC()
+		conn, err := dialGRPC(serverAddr)
 		if err != nil {
 			logger.Error("dial failed – will retry",
-				"driver_id", state.id,
+				"driver_code", state.code,
 				"error", err,
 				"backoff", backoff,
 			)
@@ -137,16 +194,20 @@ func runDriver(ctx context.Context, seed driverSeed, logger *slog.Logger) {
 			continue
 		}
 
-		// Reset backoff on successful connection.
 		backoff = backoffBase
-
 		client := locationpb.NewLocationServiceClient(conn)
 
-		// ── Open stream ───────────────────────────────────────────────────
-		stream, err := client.StreamLocation(ctx)
+		// Attach auth metadata
+		streamCtx := ctx
+		if apiKey != "" {
+			md := metadata.Pairs("authorization", "Bearer "+apiKey)
+			streamCtx = metadata.NewOutgoingContext(ctx, md)
+		}
+
+		stream, err := client.StreamLocation(streamCtx)
 		if err != nil {
 			logger.Error("failed to open stream – will retry",
-				"driver_id", state.id,
+				"driver_code", state.code,
 				"error", err,
 				"backoff", backoff,
 			)
@@ -156,31 +217,19 @@ func runDriver(ctx context.Context, seed driverSeed, logger *slog.Logger) {
 			continue
 		}
 
-		logger.Info("stream opened", "driver_id", state.id)
+		logger.Info("bidirectional stream opened", "driver_code", state.code)
 
-		// ── Send loop ─────────────────────────────────────────────────────
-		streamErr := sendLoop(ctx, stream, state, logger)
-
-		// Close stream regardless of reason.
-		resp, closeErr := stream.CloseAndRecv()
-		if closeErr != nil {
-			logger.Warn("CloseAndRecv error", "driver_id", state.id, "error", closeErr)
-		} else {
-			logger.Info("stream closed by client",
-				"driver_id", state.id,
-				"server_response", resp.GetMessage(),
-			)
-		}
+		// Send & receive loop
+		streamErr := runBidirectionalStream(streamCtx, stream, state, logger)
+		_ = stream.CloseSend()
 		conn.Close()
 
 		if streamErr == nil {
-			// Clean shutdown requested via context.
 			return
 		}
 
-		// Transient error – reconnect with backoff.
 		logger.Warn("stream error – reconnecting",
-			"driver_id", state.id,
+			"driver_code", state.code,
 			"error", streamErr,
 			"backoff", backoff,
 		)
@@ -189,48 +238,79 @@ func runDriver(ctx context.Context, seed driverSeed, logger *slog.Logger) {
 	}
 }
 
-// sendLoop sends GPS frames at sendInterval until ctx is cancelled or the
-// stream returns an error. Returns nil on clean shutdown, error otherwise.
-func sendLoop(
+func runBidirectionalStream(
 	ctx context.Context,
 	stream locationpb.LocationService_StreamLocationClient,
 	state *driverState,
 	logger *slog.Logger,
 ) error {
-	ticker := time.NewTicker(sendInterval)
-	defer ticker.Stop()
+	errChan := make(chan error, 2)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil // clean shutdown
-
-		case <-ticker.C:
-			state.advance()
-
-			req := &locationpb.LocationRequest{
-				DriverId:  state.id,
-				Latitude:  state.lat,
-				Longitude: state.lng,
-				Speed:     float32(state.speed),
-				Timestamp: time.Now().UnixMilli(),
+	// Goroutine reading LocationAcks
+	go func() {
+		for {
+			ack, err := stream.Recv()
+			if err != nil {
+				errChan <- fmt.Errorf("recv ack error: %w", err)
+				return
 			}
-
-			if err := stream.Send(req); err != nil {
-				return fmt.Errorf("send failed: %w", err)
-			}
-
-			logger.Debug("location sent",
-				"driver_id", state.id,
-				"lat", state.lat,
-				"lng", state.lng,
-				"speed", state.speed,
+			logger.Debug("received location ack",
+				"driver_code", state.code,
+				"event_id", ack.GetEventId(),
+				"accepted", ack.GetAccepted(),
+				"message", ack.GetMessage(),
 			)
 		}
+	}()
+
+	// Goroutine sending LocationRequests
+	go func() {
+		ticker := time.NewTicker(sendInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				errChan <- nil
+				return
+			case <-ticker.C:
+				state.advance()
+				eventID := uuid.New().String()
+
+				req := &locationpb.LocationRequest{
+					EventId:    eventID,
+					DriverCode: state.code,
+					Latitude:   state.lat,
+					Longitude:  state.lng,
+					Speed:      float32(state.speed),
+					Heading:    float32(state.heading),
+					Timestamp:  timestamppb.Now(),
+				}
+
+				if err := stream.Send(req); err != nil {
+					errChan <- fmt.Errorf("send frame error: %w", err)
+					return
+				}
+
+				logger.Info("sent GPS frame",
+					"driver_code", state.code,
+					"event_id", eventID,
+					"lat", state.lat,
+					"lng", state.lng,
+					"speed", state.speed,
+					"heading", state.heading,
+				)
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errChan:
+		return err
 	}
 }
-
-// ── Utility helpers ───────────────────────────────────────────────────────
 
 func sleepWithContext(ctx context.Context, d time.Duration) {
 	select {
@@ -246,30 +326,60 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
 // ── main ──────────────────────────────────────────────────────────────────
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
+	logHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	logger := slog.New(logHandler)
 	slog.SetDefault(logger)
+
+	serverAddr := getEnv("INGESTION_SERVER_ADDR", defaultServerAddr)
+	trackingURL := getEnv("TRACKING_API_URL", defaultTrackingURL)
+	apiKey := getEnv("INGESTION_API_KEY", "")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	logger.Info("simulator starting: registering drivers with tracking service",
+		"tracking_url", trackingURL,
+		"drivers_count", len(drivers),
+	)
+
+	// Step 1: Idempotent registration with tracking service
+	for _, seed := range drivers {
+		if err := registerDriver(ctx, trackingURL, seed, logger); err != nil {
+			logger.Warn("could not register driver (tracking service may be down, continuing)",
+				"driver_code", seed.code,
+				"error", err,
+			)
+		}
+	}
+
+	// Step 2: Start GPS streaming workers
 	var wg sync.WaitGroup
 	for _, seed := range drivers {
 		wg.Add(1)
-		seed := seed // capture loop variable
+		seed := seed
 		go func() {
 			defer wg.Done()
-			runDriver(ctx, seed, logger)
+			runDriver(ctx, seed, serverAddr, apiKey, logger)
 		}()
 	}
 
-	logger.Info("simulator started", "drivers", len(drivers), "server", serverAddr)
+	logger.Info("simulator running",
+		"drivers", len(drivers),
+		"ingestion_server", serverAddr,
+	)
 
-	// Wait for all driver goroutines to finish.
 	wg.Wait()
 	logger.Info("simulator stopped")
 }

@@ -1,4 +1,4 @@
-﻿// Package main is the entry point for the Fleet-Tracking tracking service.
+// Package main is the entry point for the Fleet-Tracking tracking service.
 //
 // Startup order:
 //  1. Load configuration from .env / environment variables.
@@ -42,8 +42,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Logging ────────────────────────────────────────────────────────────
-	logHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+	// ── Logging (JSON) ─────────────────────────────────────────────────────
+	logHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.LogLevel,
 	})
 	logger := slog.New(logHandler)

@@ -1,4 +1,4 @@
-﻿// Package services contains the stale-driver sweeper background goroutine.
+// Package services contains the stale-driver sweeper background goroutine.
 package services
 
 import (
@@ -86,6 +86,7 @@ func (s *StaleSweeper) sweep(ctx context.Context) {
 		if err != nil {
 			s.log.Warn("stale sweeper: cache exists check failed",
 				"driver_id", driver.ID,
+				"driver_code", driver.Code,
 				"error", err,
 			)
 			continue
@@ -98,6 +99,7 @@ func (s *StaleSweeper) sweep(ctx context.Context) {
 		// ── Driver is stale ───────────────────────────────────────────
 		s.log.Info("stale sweeper: driver went offline",
 			"driver_id", driver.ID,
+			"driver_code", driver.Code,
 			"last_status", driver.Status,
 		)
 
@@ -105,26 +107,28 @@ func (s *StaleSweeper) sweep(ctx context.Context) {
 		if err := s.driverRepo.UpdateStatus(ctx, driver.ID, models.StatusOffline); err != nil {
 			s.log.Error("stale sweeper: failed to update driver status",
 				"driver_id", driver.ID,
+				"driver_code", driver.Code,
 				"error", err,
 			)
 			continue
 		}
 
-		s.broadcastStatusChanged(driver.ID, oldStatus, models.StatusOffline)
+		s.broadcastStatusChanged(&driver, oldStatus, models.StatusOffline)
 	}
 }
 
 // broadcastStatusChanged marshals and broadcasts a driver_status_changed event.
 func (s *StaleSweeper) broadcastStatusChanged(
-	driverID string,
+	driver *models.Driver,
 	oldStatus, newStatus models.DriverStatus,
 ) {
 	evt := models.DriverStatusChangedEvent{
-		Event:     models.EventDriverStatusChanged,
-		DriverID:  driverID,
-		OldStatus: oldStatus,
-		NewStatus: newStatus,
-		Timestamp: time.Now().UTC(),
+		Event:      models.EventDriverStatusChanged,
+		DriverID:   driver.ID,
+		DriverCode: driver.Code,
+		OldStatus:  oldStatus,
+		NewStatus:  newStatus,
+		Timestamp:  time.Now().UTC(),
 	}
 	data, err := json.Marshal(evt)
 	if err != nil {

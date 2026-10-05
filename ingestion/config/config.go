@@ -28,6 +28,10 @@ type Config struct {
 	// KafkaTopic is the Kafka topic name to publish location events to.
 	// Default: "location.events"
 	KafkaTopic string
+
+	// IngestionAPIKey is the secret bearer token required from clients.
+	// If empty, authentication check is disabled (dev mode).
+	IngestionAPIKey string
 }
 
 // Load reads .env from the current working directory and returns a Config.
@@ -51,8 +55,6 @@ func Load() (*Config, error) {
 	cfg.LogLevel = parseLogLevel(getEnvOrDefault("LOG_LEVEL", "info"))
 
 	// ── KAFKA_BROKER ─────────────────────────────────────────────────────────
-	// Accepts a single address or a comma-separated list.
-	// Example: "localhost:9092" or "broker1:9092,broker2:9092"
 	rawBrokers := getEnvOrDefault("KAFKA_BROKER", "localhost:9092")
 	cfg.KafkaBrokers = parseBrokers(rawBrokers)
 	if len(cfg.KafkaBrokers) == 0 {
@@ -61,6 +63,9 @@ func Load() (*Config, error) {
 
 	// ── KAFKA_TOPIC ──────────────────────────────────────────────────────────
 	cfg.KafkaTopic = getEnvOrDefault("KAFKA_TOPIC", "location.events")
+
+	// ── INGESTION_API_KEY ────────────────────────────────────────────────────
+	cfg.IngestionAPIKey = strings.TrimSpace(os.Getenv("INGESTION_API_KEY"))
 
 	return cfg, nil
 }
@@ -87,7 +92,6 @@ func getEnvOrDefault(key, defaultVal string) string {
 }
 
 // parseLogLevel converts a string level name to a slog.Level.
-// Unknown values default to slog.LevelInfo.
 func parseLogLevel(s string) slog.Level {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug":

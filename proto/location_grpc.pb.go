@@ -26,11 +26,11 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// LocationService handles real-time GPS streaming from drivers.
+// LocationService handles bidirectional real-time GPS streaming from drivers.
 type LocationServiceClient interface {
 	// StreamLocation receives a client-side stream of GPS data points
-	// and returns a single summary response when the stream is closed.
-	StreamLocation(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[LocationRequest, LocationResponse], error)
+	// and yields a LocationAck stream acknowledging each event individually.
+	StreamLocation(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocationRequest, LocationAck], error)
 }
 
 type locationServiceClient struct {
@@ -41,28 +41,28 @@ func NewLocationServiceClient(cc grpc.ClientConnInterface) LocationServiceClient
 	return &locationServiceClient{cc}
 }
 
-func (c *locationServiceClient) StreamLocation(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[LocationRequest, LocationResponse], error) {
+func (c *locationServiceClient) StreamLocation(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocationRequest, LocationAck], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &LocationService_ServiceDesc.Streams[0], LocationService_StreamLocation_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[LocationRequest, LocationResponse]{ClientStream: stream}
+	x := &grpc.GenericClientStream[LocationRequest, LocationAck]{ClientStream: stream}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type LocationService_StreamLocationClient = grpc.ClientStreamingClient[LocationRequest, LocationResponse]
+type LocationService_StreamLocationClient = grpc.BidiStreamingClient[LocationRequest, LocationAck]
 
 // LocationServiceServer is the server API for LocationService service.
 // All implementations must embed UnimplementedLocationServiceServer
 // for forward compatibility.
 //
-// LocationService handles real-time GPS streaming from drivers.
+// LocationService handles bidirectional real-time GPS streaming from drivers.
 type LocationServiceServer interface {
 	// StreamLocation receives a client-side stream of GPS data points
-	// and returns a single summary response when the stream is closed.
-	StreamLocation(grpc.ClientStreamingServer[LocationRequest, LocationResponse]) error
+	// and yields a LocationAck stream acknowledging each event individually.
+	StreamLocation(grpc.BidiStreamingServer[LocationRequest, LocationAck]) error
 	mustEmbedUnimplementedLocationServiceServer()
 }
 
@@ -73,7 +73,7 @@ type LocationServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedLocationServiceServer struct{}
 
-func (UnimplementedLocationServiceServer) StreamLocation(grpc.ClientStreamingServer[LocationRequest, LocationResponse]) error {
+func (UnimplementedLocationServiceServer) StreamLocation(grpc.BidiStreamingServer[LocationRequest, LocationAck]) error {
 	return status.Error(codes.Unimplemented, "method StreamLocation not implemented")
 }
 func (UnimplementedLocationServiceServer) mustEmbedUnimplementedLocationServiceServer() {}
@@ -98,11 +98,11 @@ func RegisterLocationServiceServer(s grpc.ServiceRegistrar, srv LocationServiceS
 }
 
 func _LocationService_StreamLocation_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(LocationServiceServer).StreamLocation(&grpc.GenericServerStream[LocationRequest, LocationResponse]{ServerStream: stream})
+	return srv.(LocationServiceServer).StreamLocation(&grpc.GenericServerStream[LocationRequest, LocationAck]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type LocationService_StreamLocationServer = grpc.ClientStreamingServer[LocationRequest, LocationResponse]
+type LocationService_StreamLocationServer = grpc.BidiStreamingServer[LocationRequest, LocationAck]
 
 // LocationService_ServiceDesc is the grpc.ServiceDesc for LocationService service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -115,6 +115,7 @@ var LocationService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamLocation",
 			Handler:       _LocationService_StreamLocation_Handler,
+			ServerStreams: true,
 			ClientStreams: true,
 		},
 	},

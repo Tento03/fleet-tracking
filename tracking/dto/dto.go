@@ -5,6 +5,7 @@ import "time"
 
 // CreateDriverRequest is the JSON body for POST /drivers.
 type CreateDriverRequest struct {
+	Code    string `json:"code"    binding:"required,min=1,max=50"`
 	Name    string `json:"name"    binding:"required,min=1,max=100"`
 	Phone   string `json:"phone"   binding:"omitempty,max=20"`
 	Vehicle string `json:"vehicle" binding:"omitempty,max=50"`
@@ -18,6 +19,7 @@ type UpdateDriverStatusRequest struct {
 // DriverResponse is the JSON representation of a driver.
 type DriverResponse struct {
 	ID        string `json:"id"`
+	Code      string `json:"code"`
 	Name      string `json:"name"`
 	Phone     string `json:"phone"`
 	Vehicle   string `json:"vehicle"`
@@ -33,11 +35,13 @@ type ActiveDriverResponse struct {
 
 // LocationSnapshotResponse is returned by GET /drivers/:id/location.
 type LocationSnapshotResponse struct {
-	DriverID  string  `json:"driver_id"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
-	Speed     float32 `json:"speed"`
-	UpdatedAt string  `json:"updated_at"`
+	DriverID   string  `json:"driver_id"`
+	DriverCode string  `json:"driver_code"`
+	Latitude   float64 `json:"latitude"`
+	Longitude  float64 `json:"longitude"`
+	Speed      float32 `json:"speed"`
+	Heading    float32 `json:"heading"`
+	UpdatedAt  string  `json:"updated_at"`
 }
 
 // LocationHistoryItem is one GPS point in the history response.
@@ -45,6 +49,7 @@ type LocationHistoryItem struct {
 	Latitude  float64 `json:"latitude"`
 	Longitude float64 `json:"longitude"`
 	Speed     float32 `json:"speed"`
+	Heading   float32 `json:"heading"`
 	Timestamp string  `json:"timestamp"`
 }
 
