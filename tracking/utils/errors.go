@@ -53,6 +53,9 @@ var (
 	// ErrLocationNotFound is returned when no location history matches the query.
 	ErrLocationNotFound = errors.New("location history not found")
 
+	// ErrGeofenceNotFound is returned when a geofence ID resolves to no record.
+	ErrGeofenceNotFound = errors.New("geofence not found")
+
 	// ErrDatabase is returned on unrecoverable MySQL/GORM failures.
 	ErrDatabase = errors.New("database error")
 
@@ -89,7 +92,10 @@ func RespondError(c *gin.Context, err error) {
 
 	// Fallback: map well-known sentinel errors.
 	switch {
-	case errors.Is(err, ErrNotFound), errors.Is(err, ErrDriverNotFound), errors.Is(err, ErrLocationNotFound):
+	case errors.Is(err, ErrNotFound),
+		errors.Is(err, ErrDriverNotFound),
+		errors.Is(err, ErrLocationNotFound),
+		errors.Is(err, ErrGeofenceNotFound):
 		c.JSON(http.StatusNotFound, ErrorResponse{
 			Error:   http.StatusText(http.StatusNotFound),
 			Message: err.Error(),

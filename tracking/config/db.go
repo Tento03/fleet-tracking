@@ -56,6 +56,9 @@ func NewDB(cfg *Config) (*gorm.DB, error) {
 	if err := db.AutoMigrate(
 		&models.Driver{},
 		&models.LocationHistory{},
+		&models.Geofence{},
+		&models.GeofenceState{},
+		&models.GeofenceAlert{},
 	); err != nil {
 		return nil, fmt.Errorf("gorm: AutoMigrate failed: %w", err)
 	}

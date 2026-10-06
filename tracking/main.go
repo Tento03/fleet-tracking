@@ -74,17 +74,20 @@ func main() {
 	driverRepo := repositories.NewDriverRepository(db)
 	locationRepo := repositories.NewLocationRepository(db)
 	locationCache := repositories.NewLocationCache(redisClient)
+	geofenceRepo := repositories.NewGeofenceRepository(db)
 
 	// ── 5. WebSocket Hub ───────────────────────────────────────────────────
 	hub := trackingws.NewHub(logger)
 	go hub.Run(ctx)
 
 	// ── 6. Services ────────────────────────────────────────────────────────
+	geofenceSvc := services.NewGeofenceService(geofenceRepo, hub, logger)
 	locationService := services.NewLocationService(
 		driverRepo,
 		locationRepo,
 		locationCache,
 		hub,
+		geofenceSvc,
 		logger,
 	)
 	staleSweeper := services.NewStaleSweeper(
@@ -149,8 +152,10 @@ func main() {
 		DriverRepo:    driverRepo,
 		LocationRepo:  locationRepo,
 		LocationCache: locationCache,
+		GeofenceRepo:  geofenceRepo,
 		Hub:           hub,
 		KafkaChecker:  consumer,
+		GeofenceSvc:   geofenceSvc,
 		CORSOrigin:    cfg.CORSOrigin,
 		Timezone:      tz,
 		Logger:        logger,

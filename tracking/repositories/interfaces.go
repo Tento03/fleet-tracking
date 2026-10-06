@@ -80,3 +80,49 @@ type LocationCache interface {
 	// Exists reports whether the cache key for driverID is present.
 	Exists(ctx context.Context, driverID string) (bool, error)
 }
+
+// ── GeofenceRepository ────────────────────────────────────────────────────
+
+// GeofenceRepository defines all persistence operations for geofences,
+// geofence state, and geofence alerts.
+type GeofenceRepository interface {
+	// ── CRUD ──────────────────────────────────────────────────────────────
+
+	// Create inserts a new geofence. The BeforeCreate hook assigns a UUID.
+	Create(ctx context.Context, g *models.Geofence) error
+
+	// FindByID retrieves a geofence by UUID primary key.
+	// Returns utils.ErrGeofenceNotFound when no row matches.
+	FindByID(ctx context.Context, id string) (*models.Geofence, error)
+
+	// FindAll returns all geofences ordered by created_at DESC.
+	// Pass activeOnly = true to filter inactive (soft-deleted) geofences.
+	FindAll(ctx context.Context, activeOnly bool) ([]models.Geofence, error)
+
+	// Update persists changes to an existing geofence.
+	Update(ctx context.Context, g *models.Geofence) error
+
+	// Delete soft-deletes a geofence by setting active = false.
+	// Returns utils.ErrGeofenceNotFound when no row matches.
+	Delete(ctx context.Context, id string) error
+
+	// ── State ─────────────────────────────────────────────────────────────
+
+	// GetState returns the current containment state for a driver-geofence pair.
+	// Returns (nil, nil) when the pair has no state row yet.
+	GetState(ctx context.Context, driverID, geofenceID string) (*models.GeofenceState, error)
+
+	// UpsertState inserts or updates the containment state row.
+	UpsertState(ctx context.Context, s *models.GeofenceState) error
+
+	// ── Alerts ────────────────────────────────────────────────────────────
+
+	// CreateAlert inserts a new geofence crossing alert record.
+	CreateAlert(ctx context.Context, a *models.GeofenceAlert) error
+
+	// FindAlerts returns alerts filtered by optional driverID / geofenceID
+	// and time window [from, to], ordered by triggered_at DESC.
+	// Pass empty strings / zero times to skip individual filters.
+	FindAlerts(ctx context.Context, driverID, geofenceID string, from, to time.Time) ([]models.GeofenceAlert, error)
+}
+

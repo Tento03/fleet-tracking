@@ -1,4 +1,4 @@
-﻿// Package routes registers the Gin HTTP routes for the tracking service.
+// Package routes registers the Gin HTTP routes for the tracking service.
 package routes
 
 import (
@@ -12,6 +12,7 @@ import (
 
 	"github.com/Tento03/fleet-tracking/tracking/controllers"
 	"github.com/Tento03/fleet-tracking/tracking/repositories"
+	"github.com/Tento03/fleet-tracking/tracking/services"
 	trackingws "github.com/Tento03/fleet-tracking/tracking/websocket"
 )
 
@@ -26,8 +27,12 @@ type Config struct {
 	DriverRepo    repositories.DriverRepository
 	LocationRepo  repositories.LocationRepository
 	LocationCache repositories.LocationCache
+	GeofenceRepo  repositories.GeofenceRepository
 	Hub           *trackingws.Hub
 	KafkaChecker  KafkaChecker
+
+	// Services (passed in to avoid re-construction inside routes)
+	GeofenceSvc *services.GeofenceService
 
 	// Config values
 	CORSOrigin string
@@ -35,7 +40,7 @@ type Config struct {
 	Logger     *slog.Logger
 
 	// DB/Redis for health-check
-	SQLDB  *sql.DB
+	SQLDB   *sql.DB
 	RedisCl *redis.Client
 }
 
@@ -70,6 +75,7 @@ func Setup(r *gin.Engine, cfg Config) {
 	dashCtrl := controllers.NewDashboardController(
 		cfg.DriverRepo, cfg.LocationRepo, cfg.Hub, cfg.CORSOrigin, cfg.Timezone, logger,
 	)
+	geofenceCtrl := controllers.NewGeofenceController(cfg.GeofenceSvc, logger)
 
 	// ── Ping ──────────────────────────────────────────────────────────────
 	r.GET("/ping", func(c *gin.Context) {
@@ -132,6 +138,17 @@ func Setup(r *gin.Engine, cfg Config) {
 	// ── Locations ─────────────────────────────────────────────────────────
 	r.GET("/drivers/:id/location", locationCtrl.GetLastLocation)
 	r.GET("/drivers/:id/history", locationCtrl.GetHistory)
+
+	// ── Geofences ─────────────────────────────────────────────────────────
+	// IMPORTANT: /geofences/alerts must be registered BEFORE /geofences/:id
+	// so Gin does not swallow "alerts" as a path parameter.
+	r.GET("/geofences/alerts", geofenceCtrl.GetAlerts)
+
+	r.POST("/geofences", geofenceCtrl.Create)
+	r.GET("/geofences", geofenceCtrl.List)
+	r.GET("/geofences/:id", geofenceCtrl.GetByID)
+	r.PUT("/geofences/:id", geofenceCtrl.Update)
+	r.DELETE("/geofences/:id", geofenceCtrl.Delete)
 }
 
 // Register is kept for backward compatibility with the old signature used in

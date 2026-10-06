@@ -24,14 +24,16 @@ const locationTTL = 300 * time.Second
 //  3. Caches position snapshot in Redis.
 //  4. Appends to MySQL location_history (FK to drivers.id).
 //  5. Auto-sets status from offline to online.
-//  6. Emits WebSocket broadcast events.
+//  6. Evaluates all active geofences → fires enter/exit alerts on boundary crossings.
+//  7. Emits WebSocket broadcast events.
 type LocationService struct {
-	driverRepo    repositories.DriverRepository
-	locationRepo  repositories.LocationRepository
-	locationCache repositories.LocationCache
-	broadcaster   websocket.Broadcaster
-	codeCache     sync.Map // key: driver_code (string) → value: *models.Driver
-	log           *slog.Logger
+	driverRepo      repositories.DriverRepository
+	locationRepo    repositories.LocationRepository
+	locationCache   repositories.LocationCache
+	broadcaster     websocket.Broadcaster
+	geofenceSvc     *GeofenceService
+	codeCache       sync.Map // key: driver_code (string) → value: *models.Driver
+	log             *slog.Logger
 }
 
 // NewLocationService constructs a LocationService with all required dependencies.
@@ -40,6 +42,7 @@ func NewLocationService(
 	locationRepo repositories.LocationRepository,
 	locationCache repositories.LocationCache,
 	broadcaster websocket.Broadcaster,
+	geofenceSvc *GeofenceService,
 	logger *slog.Logger,
 ) *LocationService {
 	if logger == nil {
@@ -50,6 +53,7 @@ func NewLocationService(
 		locationRepo:  locationRepo,
 		locationCache: locationCache,
 		broadcaster:   broadcaster,
+		geofenceSvc:   geofenceSvc,
 		log:           logger,
 	}
 }
@@ -120,7 +124,12 @@ func (s *LocationService) ProcessLocation(ctx context.Context, event *models.Loc
 		return fmt.Errorf("location service: insert history: %w", err)
 	}
 
-	// ── 5. Auto-online: offline → online ──────────────────────────────────
+	// ── 5. Geofence evaluation (non-fatal) ────────────────────────────────
+	if s.geofenceSvc != nil {
+		go s.geofenceSvc.CheckGeofences(ctx, driver, event.Latitude, event.Longitude, ts)
+	}
+
+	// ── 6. Auto-online: offline → online ──────────────────────────────────
 	currentStatus := driver.Status
 	if driver.Status == models.StatusOffline {
 		if err := s.driverRepo.UpdateStatus(ctx, driver.ID, models.StatusOnline); err != nil {
