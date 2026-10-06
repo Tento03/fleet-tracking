@@ -59,7 +59,7 @@ var drivers = []driverSeed{
 		name:    "Budi Santoso",
 		phone:   "081234567801",
 		vehicle: "BK 1001 AA",
-		lat:     -3.5952,
+		lat:     3.5952,
 		lng:     98.6722,
 	},
 	{
@@ -67,7 +67,7 @@ var drivers = []driverSeed{
 		name:    "Rian Hidayat",
 		phone:   "081234567802",
 		vehicle: "BK 2002 BB",
-		lat:     -3.6012,
+		lat:     3.6012,
 		lng:     98.6800,
 	},
 	{
@@ -75,7 +75,7 @@ var drivers = []driverSeed{
 		name:    "Dewi Lestari",
 		phone:   "081234567803",
 		vehicle: "BK 3003 CC",
-		lat:     -3.5880,
+		lat:     3.5880,
 		lng:     98.6650,
 	},
 }

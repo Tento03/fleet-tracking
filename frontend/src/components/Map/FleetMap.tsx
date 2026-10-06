@@ -15,7 +15,7 @@ interface FleetMapProps {
   centerTrigger: number;
 }
 
-const MEDAN_COORDS: [number, number] = [-3.5952, 98.6722];
+const MEDAN_COORDS: [number, number] = [3.5952, 98.6722];
 
 export const FleetMap: React.FC<FleetMapProps> = ({
   drivers,

@@ -13,6 +13,7 @@ import {
   WebSocketMessage 
 } from '@/types';
 import { 
+  fetchActiveDrivers,
   fetchGeofences, 
   fetchRecentAlerts, 
   fetchAllDrivers 
@@ -70,15 +71,43 @@ export default function DashboardPage() {
   // Initial Data Fetch
   useEffect(() => {
     async function initData() {
-      const [driverList, geoList, alertList] = await Promise.all([
+      const [activeList, driverList, geoList, alertList] = await Promise.all([
+        fetchActiveDrivers(),
         fetchAllDrivers(),
         fetchGeofences(),
         fetchRecentAlerts(15),
       ]);
 
-      if (driverList && driverList.length > 0) {
+      const initialTelemetry: Record<string, LocationTelemetry> = {};
+
+      if (activeList && activeList.length > 0) {
+        setDrivers(activeList);
+        activeList.forEach((d) => {
+          if (d.last_location) {
+            const rawLat = Number(d.last_location.latitude);
+            const lat = rawLat < 0 ? Math.abs(rawLat) : rawLat;
+            initialTelemetry[d.code] = {
+              event_id: d.id,
+              driver_id: d.id,
+              driver_code: d.code,
+              driver_name: d.name,
+              vehicle: d.vehicle,
+              latitude: lat,
+              longitude: Number(d.last_location.longitude),
+              speed: Number(d.last_location.speed || 0),
+              heading: Number(d.last_location.heading || 0),
+              timestamp: d.last_location.updated_at || new Date().toISOString(),
+            };
+          }
+        });
+      } else if (driverList && driverList.length > 0) {
         setDrivers(driverList);
       }
+
+      if (Object.keys(initialTelemetry).length > 0) {
+        setTelemetryMap(initialTelemetry);
+      }
+
       if (geoList && geoList.length > 0) {
         setGeofences(geoList);
       }
@@ -105,21 +134,25 @@ export default function DashboardPage() {
 
       ws.onmessage = (event) => {
         try {
-          const msg: WebSocketMessage = JSON.parse(event.data);
+          const raw = JSON.parse(event.data);
+          const eventType = raw.event || raw.type;
 
-          if (msg.type === 'location_update') {
-            const data = msg.data as unknown as LocationTelemetry;
+          if (eventType === 'location_updated' || eventType === 'location_update') {
+            const data = (raw.data || raw) as Record<string, unknown>;
+            const rawLat = Number(data.latitude);
+            const lat = rawLat < 0 ? Math.abs(rawLat) : rawLat;
+
             const telem: LocationTelemetry = {
-              event_id: data.event_id || '',
-              driver_id: data.driver_id || '',
-              driver_code: data.driver_code || '',
-              driver_name: data.driver_name,
-              vehicle: data.vehicle,
-              latitude: Number(data.latitude),
+              event_id: String(data.event_id || ''),
+              driver_id: String(data.driver_id || ''),
+              driver_code: String(data.driver_code || ''),
+              driver_name: data.driver_name ? String(data.driver_name) : undefined,
+              vehicle: data.vehicle ? String(data.vehicle) : undefined,
+              latitude: lat,
               longitude: Number(data.longitude),
               speed: Number(data.speed || 0),
               heading: Number(data.heading || 0),
-              timestamp: data.timestamp || new Date().toISOString(),
+              timestamp: String(data.timestamp || new Date().toISOString()),
             };
 
             setTelemetryMap((prev) => ({
@@ -145,8 +178,25 @@ export default function DashboardPage() {
               }
               return prev;
             });
-          } else if (msg.type === 'geofence_alert') {
-            const alertData = msg.data as unknown as GeofenceAlert;
+          } else if (eventType === 'geofence_alert') {
+            const data = (raw.data || raw) as Record<string, unknown>;
+            const rawLat = Number(data.latitude);
+            const lat = rawLat < 0 ? Math.abs(rawLat) : rawLat;
+
+            const alertData: GeofenceAlert = {
+              id: String(data.id || `${data.driver_code}-${data.triggered_at || data.timestamp || Date.now()}`),
+              geofence_id: String(data.geofence_id || ''),
+              geofence_name: data.geofence_name ? String(data.geofence_name) : undefined,
+              driver_id: String(data.driver_id || ''),
+              driver_code: String(data.driver_code || ''),
+              driver_name: data.driver_name ? String(data.driver_name) : undefined,
+              event_type: (data.alert_type === 'enter' || data.event_type === 'ENTER') ? 'ENTER' : 'EXIT',
+              latitude: lat,
+              longitude: Number(data.longitude),
+              speed: Number(data.speed || 0),
+              timestamp: String(data.triggered_at || data.timestamp || new Date().toISOString()),
+            };
+
             setAlerts((prev) => [alertData, ...prev.slice(0, 20)]);
             playAlertSound();
           }

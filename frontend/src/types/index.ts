@@ -7,6 +7,15 @@ export interface Driver {
   status: 'active' | 'inactive' | 'idle' | string;
   created_at?: string;
   updated_at?: string;
+  last_location?: {
+    driver_id: string;
+    driver_code: string;
+    latitude: number;
+    longitude: number;
+    speed: number;
+    heading: number;
+    updated_at: string;
+  };
 }
 
 export interface LocationTelemetry {
