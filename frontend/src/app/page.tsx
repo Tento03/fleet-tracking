@@ -9,8 +9,7 @@ import {
   Driver, 
   LocationTelemetry, 
   Geofence, 
-  GeofenceAlert, 
-  WebSocketMessage 
+  GeofenceAlert 
 } from '@/types';
 import { 
   fetchActiveDrivers,
@@ -42,6 +41,8 @@ export default function DashboardPage() {
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [showGeofences, setShowGeofences] = useState<boolean>(true);
   const [centerTrigger, setCenterTrigger] = useState<number>(0);
+  const [mapStyle, setMapStyle] = useState<'street' | 'dark' | 'satellite'>('street');
+  const [fitFleetTrigger, setFitFleetTrigger] = useState<number>(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -248,6 +249,10 @@ export default function DashboardPage() {
     setCenterTrigger((prev) => prev + 1);
   };
 
+  const handleFitFleet = () => {
+    setFitFleetTrigger((prev) => prev + 1);
+  };
+
   const handleClearAlerts = () => {
     setAlerts([]);
   };
@@ -261,8 +266,11 @@ export default function DashboardPage() {
         avgSpeed={avgSpeed}
         alertCount={alerts.length}
         showGeofences={showGeofences}
+        mapStyle={mapStyle}
+        onSelectMapStyle={setMapStyle}
         onToggleGeofences={() => setShowGeofences(!showGeofences)}
         onCenterMap={handleCenterMap}
+        onFitFleet={handleFitFleet}
       />
 
       {/* Main Body (Sidebar + Map) */}
@@ -283,8 +291,11 @@ export default function DashboardPage() {
             geofences={geofences}
             selectedDriverId={selectedDriverId}
             showGeofences={showGeofences}
+            mapStyle={mapStyle}
+            onSelectMapStyle={setMapStyle}
             onSelectDriver={handleSelectDriver}
             centerTrigger={centerTrigger}
+            fitFleetTrigger={fitFleetTrigger}
           />
         </div>
 

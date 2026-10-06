@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import L from 'leaflet';
 import { Driver, LocationTelemetry, Geofence } from '@/types';
 import { Navigation, Map } from 'lucide-react';
@@ -11,8 +11,11 @@ interface FleetMapProps {
   geofences: Geofence[];
   selectedDriverId: string | null;
   showGeofences: boolean;
+  mapStyle: 'street' | 'dark' | 'satellite';
+  onSelectMapStyle: (style: 'street' | 'dark' | 'satellite') => void;
   onSelectDriver: (driverId: string) => void;
   centerTrigger: number;
+  fitFleetTrigger: number;
 }
 
 const MEDAN_COORDS: [number, number] = [3.5952, 98.6722];
@@ -23,8 +26,11 @@ export const FleetMap: React.FC<FleetMapProps> = ({
   geofences,
   selectedDriverId,
   showGeofences,
+  mapStyle,
+  onSelectMapStyle,
   onSelectDriver,
   centerTrigger,
+  fitFleetTrigger,
 }) => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
@@ -33,8 +39,7 @@ export const FleetMap: React.FC<FleetMapProps> = ({
   const trailsRef = useRef<Record<string, L.Polyline>>({});
   const trailPointsRef = useRef<Record<string, [number, number][]>>({});
   const geofenceLayersRef = useRef<L.LayerGroup | null>(null);
-
-  const [mapStyle, setMapStyle] = useState<'street' | 'dark' | 'satellite'>('street');
+  const hasAutoFittedRef = useRef<boolean>(false);
 
   // Initialize Leaflet Map
   useEffect(() => {
@@ -104,16 +109,34 @@ export const FleetMap: React.FC<FleetMapProps> = ({
     }
   }, [centerTrigger]);
 
-  // Handle Fly-To on Driver Selection
+  // Handle Focus Fleet (Fit Bounds to all active vehicles)
+  useEffect(() => {
+    if (!mapInstanceRef.current || fitFleetTrigger <= 0) return;
+    const coords = Object.values(telemetryMap).map(
+      (t) => [t.latitude, t.longitude] as [number, number]
+    );
+    if (coords.length > 0) {
+      const bounds = L.latLngBounds(coords);
+      mapInstanceRef.current.fitBounds(bounds, { padding: [60, 60], maxZoom: 15 });
+    }
+  }, [fitFleetTrigger, telemetryMap]);
+
+  // Handle Fly-To on Driver Selection (works by either UUID or driver_code)
   useEffect(() => {
     if (!selectedDriverId || !mapInstanceRef.current) return;
 
-    // Find driver telem
-    const telem = telemetryMap[selectedDriverId];
+    // Find driver telem by code or id
+    const telem =
+      telemetryMap[selectedDriverId] ||
+      Object.values(telemetryMap).find(
+        (t) => t.driver_id === selectedDriverId || t.driver_code === selectedDriverId
+      );
+
     if (telem) {
-      mapInstanceRef.current.flyTo([telem.latitude, telem.longitude], 16, { duration: 1.0 });
+      mapInstanceRef.current.flyTo([telem.latitude, telem.longitude], 15, { duration: 1.0 });
       // Open popup
-      const marker = markersRef.current[telem.driver_code] || markersRef.current[selectedDriverId];
+      const marker =
+        markersRef.current[telem.driver_code] || markersRef.current[selectedDriverId];
       if (marker) {
         marker.openPopup();
       }
@@ -174,6 +197,16 @@ export const FleetMap: React.FC<FleetMapProps> = ({
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map) return;
+
+    // Auto-fit bounds on initial vehicle load so they are immediately visible on screen
+    const allCoords = Object.values(telemetryMap).map(
+      (t) => [t.latitude, t.longitude] as [number, number]
+    );
+    if (allCoords.length > 0 && !hasAutoFittedRef.current) {
+      hasAutoFittedRef.current = true;
+      const bounds = L.latLngBounds(allCoords);
+      map.fitBounds(bounds, { padding: [60, 60], maxZoom: 15 });
+    }
 
     Object.values(telemetryMap).forEach((telem) => {
       const driver = drivers.find(
@@ -309,7 +342,7 @@ export const FleetMap: React.FC<FleetMapProps> = ({
       <div ref={mapContainerRef} className="w-full h-full" id="fleet-map" />
 
       {/* Floating Map Controls & Legend */}
-      <div className="absolute top-4 right-4 z-10 bg-slate-950/85 border border-slate-800/80 backdrop-blur-md rounded-xl p-3 text-xs font-mono shadow-xl hidden sm:block max-w-[220px]">
+      <div className="absolute top-4 right-4 z-[1000] bg-slate-950/95 border border-slate-700/80 backdrop-blur-md rounded-xl p-3 text-xs font-mono shadow-2xl block max-w-[220px]">
         {/* Style Switcher */}
         <div className="flex items-center space-x-1.5 text-slate-300 font-semibold mb-2">
           <Map className="w-4 h-4 text-cyan-400" />
@@ -317,7 +350,7 @@ export const FleetMap: React.FC<FleetMapProps> = ({
         </div>
         <div className="grid grid-cols-3 gap-1 bg-slate-900/90 border border-slate-800 p-1 rounded-lg mb-3">
           <button
-            onClick={() => setMapStyle('street')}
+            onClick={() => onSelectMapStyle('street')}
             className={`py-1 text-[10px] font-bold rounded transition ${
               mapStyle === 'street'
                 ? 'bg-cyan-500 text-slate-950 shadow-sm'
@@ -327,7 +360,7 @@ export const FleetMap: React.FC<FleetMapProps> = ({
             Terang
           </button>
           <button
-            onClick={() => setMapStyle('satellite')}
+            onClick={() => onSelectMapStyle('satellite')}
             className={`py-1 text-[10px] font-bold rounded transition ${
               mapStyle === 'satellite'
                 ? 'bg-cyan-500 text-slate-950 shadow-sm'
@@ -337,7 +370,7 @@ export const FleetMap: React.FC<FleetMapProps> = ({
             Satelit
           </button>
           <button
-            onClick={() => setMapStyle('dark')}
+            onClick={() => onSelectMapStyle('dark')}
             className={`py-1 text-[10px] font-bold rounded transition ${
               mapStyle === 'dark'
                 ? 'bg-cyan-500 text-slate-950 shadow-sm'
